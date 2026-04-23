@@ -1,0 +1,33 @@
+# lakesh config — see `lakesh config init` for a copy of this written to
+# your $XDG_CONFIG_HOME/lakesh/config.toml (or ~/.config/lakesh/config.toml).
+
+default = "local"
+
+[profiles.local]
+uri       = "http://127.0.0.1:8181"
+warehouse = "lake"
+
+[profiles.local.s3]
+endpoint   = "http://127.0.0.1:9000"
+region     = "us-east-1"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+path_style = true
+
+# Uncomment if your local catalog has DUCKICELAKE_OAUTH_CLIENTS configured.
+# [profiles.local.oauth]
+# client_id     = "demo-client"
+# client_secret = "demo-secret"
+
+# Example production profile using environment-backed secrets.
+# [profiles.prod]
+# uri       = "https://catalog.prod.example.com"
+# warehouse = "prod"
+#
+# [profiles.prod.s3]
+# region = "us-west-2"
+# # access_key + secret_key come from IAM role / IRSA automatically when omitted.
+#
+# [profiles.prod.oauth]
+# client_id_env     = "LAKESH_PROD_CLIENT_ID"
+# client_secret_env = "LAKESH_PROD_CLIENT_SECRET"

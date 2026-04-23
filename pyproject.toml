@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lakesh"
+version = "0.1.0"
+description = "DuckDB-powered SQL CLI for Iceberg REST catalogs — profiles, interactive REPL, one-shot queries"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Kevin Keller", email = "kellerkev@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database :: Front-Ends",
+]
+dependencies = [
+    "duckdb>=1.4,<2",
+    "typer>=0.12,<1",
+    "rich>=13,<15",
+    "prompt-toolkit>=3.0,<4",
+    "httpx>=0.27,<1",
+    # tomllib is stdlib on 3.11+; no extra dep needed.
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+lakesh = "lakesh.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/KellerKev/lakesh"
+Issues = "https://github.com/KellerKev/lakesh/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lakesh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
