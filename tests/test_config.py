@@ -189,3 +189,82 @@ def test_default_path_falls_back_to_xdg(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("LAKESH_CONFIG", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     assert default_config_path() == tmp_path / "lakesh" / "config.toml"
+
+
+# --------------------------------------------------------------------------
+# DuckLake profile type
+
+
+def test_ducklake_profile_parses(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.lake]
+type         = "ducklake"
+postgres_dsn = "dbname=ducklake host=/tmp/.pgsock port=55432 user=ducklake"
+data_path    = "s3://lakehouse/data/"
+catalog      = "lake"
+
+[profiles.lake.s3]
+endpoint   = "http://127.0.0.1:9000"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+""")
+    prof = load_config(p).get("lake")
+    assert prof.type == "ducklake"
+    assert prof.postgres_dsn.startswith("dbname=ducklake")
+    assert prof.data_path == "s3://lakehouse/data/"
+    assert prof.catalog == "lake"
+    assert prof.s3.endpoint == "http://127.0.0.1:9000"
+
+
+def test_ducklake_missing_dsn_errors(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.lake]
+type      = "ducklake"
+data_path = "s3://b/p/"
+""")
+    with pytest.raises(ConfigError, match="postgres_dsn"):
+        load_config(p)
+
+
+def test_ducklake_missing_data_path_errors(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.lake]
+type         = "ducklake"
+postgres_dsn = "dbname=x host=/tmp user=u"
+""")
+    with pytest.raises(ConfigError, match="data_path"):
+        load_config(p)
+
+
+def test_ducklake_catalog_defaults_to_lake(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.p]
+type         = "ducklake"
+postgres_dsn = "dbname=x host=/tmp user=u"
+data_path    = "s3://b/p/"
+""")
+    assert load_config(p).get("p").catalog == "lake"
+
+
+def test_ducklake_dsn_via_env(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LAKESH_TEST_DSN", "dbname=env_db host=/tmp user=env_u")
+    p = _write(tmp_path, """
+[profiles.p]
+type             = "ducklake"
+postgres_dsn_env = "LAKESH_TEST_DSN"
+data_path        = "s3://b/p/"
+""")
+    assert load_config(p).get("p").postgres_dsn.startswith("dbname=env_db")
+
+
+def test_unknown_type_still_errors(tmp_path: Path):
+    """Regression guard: adding ducklake didn't open the door to any
+    other type silently being accepted."""
+    p = _write(tmp_path, """
+[profiles.p]
+type = "snowflake"
+uri  = "https://x.snowflakecomputing.com"
+warehouse = "w"
+""")
+    with pytest.raises(ConfigError, match="unknown type"):
+        load_config(p)

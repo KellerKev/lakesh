@@ -17,6 +17,7 @@ from pygments.lexers.sql import SqlLexer
 from rich.console import Console
 
 from .config import Profile
+from .duck import catalog_alias
 from .output import render_table
 
 
@@ -42,22 +43,27 @@ def _history_path() -> Path:
     return p
 
 
-def _list_ns(con: duckdb.DuckDBPyConnection) -> list[str]:
+def _list_ns(con: duckdb.DuckDBPyConnection, catalog: str) -> list[str]:
     try:
         rows = con.execute(
             "SELECT DISTINCT schema_name FROM information_schema.schemata "
-            "WHERE catalog_name='ice' AND schema_name NOT IN ('main','information_schema','pg_catalog') "
-            "ORDER BY 1"
+            "WHERE catalog_name = ? "
+            "  AND schema_name NOT IN ('main','information_schema','pg_catalog') "
+            "ORDER BY 1",
+            [catalog],
         ).fetchall()
         return [r[0] for r in rows]
     except duckdb.Error:
         return []
 
 
-def _list_tables(con: duckdb.DuckDBPyConnection, ns: str | None = None) -> list[tuple[str, str]]:
+def _list_tables(
+    con: duckdb.DuckDBPyConnection, catalog: str, ns: str | None = None,
+) -> list[tuple[str, str]]:
     q = ("SELECT table_schema, table_name FROM information_schema.tables "
-         "WHERE table_catalog='ice' AND table_schema NOT IN ('main','information_schema','pg_catalog')")
-    params: list = []
+         "WHERE table_catalog = ? "
+         "  AND table_schema NOT IN ('main','information_schema','pg_catalog')")
+    params: list = [catalog]
     if ns:
         q += " AND table_schema = ?"
         params.append(ns)
@@ -68,7 +74,7 @@ def _list_tables(con: duckdb.DuckDBPyConnection, ns: str | None = None) -> list[
         return []
 
 
-def _build_completer(con: duckdb.DuckDBPyConnection) -> WordCompleter:
+def _build_completer(con: duckdb.DuckDBPyConnection, catalog: str) -> WordCompleter:
     keywords = [
         "SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY", "LIMIT",
         "JOIN", "LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "ON", "AS",
@@ -76,22 +82,24 @@ def _build_completer(con: duckdb.DuckDBPyConnection) -> WordCompleter:
         "CREATE TABLE", "DROP TABLE", "ALTER TABLE", "DESCRIBE", "SHOW",
     ]
     names: list[str] = []
-    for ns in _list_ns(con):
+    for ns in _list_ns(con, catalog):
         names.append(ns)
-        for _, tbl in _list_tables(con, ns):
+        for _, tbl in _list_tables(con, catalog, ns):
             names.append(f"{ns}.{tbl}")
-            names.append(f"ice.{ns}.{tbl}")
+            names.append(f"{catalog}.{ns}.{tbl}")
     return WordCompleter(keywords + names, ignore_case=True, sentence=False)
 
 
-def _describe(con: duckdb.DuckDBPyConnection, ns: str, tbl: str, console: Console) -> None:
+def _describe(
+    con: duckdb.DuckDBPyConnection, catalog: str, ns: str, tbl: str, console: Console,
+) -> None:
     try:
         rows = con.execute(
             "SELECT column_name, data_type, is_nullable, ordinal_position "
             "FROM information_schema.columns "
-            "WHERE table_catalog='ice' AND table_schema=? AND table_name=? "
+            "WHERE table_catalog = ? AND table_schema=? AND table_name=? "
             "ORDER BY ordinal_position",
-            [ns, tbl],
+            [catalog, ns, tbl],
         ).fetchall()
     except duckdb.Error as e:
         console.print(f"[red]describe failed: {e}[/red]")
@@ -104,7 +112,8 @@ def _describe(con: duckdb.DuckDBPyConnection, ns: str, tbl: str, console: Consol
 
 
 def _handle_meta(
-    con: duckdb.DuckDBPyConnection, console: Console, cmd: str, state: dict,
+    con: duckdb.DuckDBPyConnection, catalog: str,
+    console: Console, cmd: str, state: dict,
 ) -> bool:
     """Returns True if we should continue the REPL, False to quit."""
     parts = cmd.strip().split()
@@ -115,19 +124,19 @@ def _handle_meta(
     if head in (r"\?", r"\h", r"\help"):
         console.print(_META_HELP)
     elif head == r"\l":
-        ns = _list_ns(con)
+        ns = _list_ns(con, catalog)
         render_table(console, ["namespace"], [(n,) for n in ns],
                      title="namespaces")
     elif head == r"\d":
         if not args:
-            rows = _list_tables(con)
+            rows = _list_tables(con, catalog)
             render_table(console, ["namespace", "table"], rows,
                          title="tables")
         elif "." in args[0]:
             ns, tbl = args[0].split(".", 1)
-            _describe(con, ns, tbl, console)
+            _describe(con, catalog, ns, tbl, console)
         else:
-            rows = _list_tables(con, args[0])
+            rows = _list_tables(con, catalog, args[0])
             render_table(console, ["namespace", "table"], rows,
                          title=f"tables in {args[0]}")
     elif head == r"\timing":
@@ -152,16 +161,23 @@ def _handle_meta(
 def run_repl(profile: Profile, con: duckdb.DuckDBPyConnection, console: Console) -> int:
     """Interactive loop. Returns a process exit code."""
     import time
+    catalog = catalog_alias(profile)
+    banner_tail = (
+        f"[cyan]{profile.uri}[/cyan], warehouse [cyan]{profile.warehouse}[/cyan]"
+        if profile.type == "iceberg-rest"
+        else f"DuckLake @ [cyan]{profile.data_path}[/cyan] "
+             f"(catalog [cyan]{catalog}[/cyan])"
+    )
     console.print(
         f"[bold green]lakesh[/bold green] connected to [bold]{profile.name}[/bold] "
-        f"([cyan]{profile.uri}[/cyan], warehouse [cyan]{profile.warehouse}[/cyan])"
+        f"({banner_tail})"
     )
     console.print("Type SQL terminated with `;`, or \\? for help. \\q to quit.\n")
 
     session = PromptSession(
         history=FileHistory(str(_history_path())),
         lexer=PygmentsLexer(SqlLexer),
-        completer=_build_completer(con),
+        completer=_build_completer(con, catalog),
         multiline=True,
         style=Style.from_dict({"prompt": "ansigreen"}),
     )
@@ -176,7 +192,7 @@ def run_repl(profile: Profile, con: duckdb.DuckDBPyConnection, console: Console)
             if not text:
                 continue
             if text.startswith("\\"):
-                if not _handle_meta(con, console, text, state):
+                if not _handle_meta(con, catalog, console, text, state):
                     break
                 continue
             t0 = time.perf_counter()

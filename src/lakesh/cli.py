@@ -19,7 +19,7 @@ from .config import (
     load_config,
     write_example_config,
 )
-from .duck import connect
+from .duck import catalog_alias, connect
 from .output import render_csv, render_json, render_table
 
 
@@ -173,6 +173,28 @@ def exec(
 
 
 # --------------------------------------------------------------------------
+# mcp — run as an MCP server on stdio
+
+@app.command()
+def mcp():
+    """Run lakesh as an MCP server on stdio.
+
+    Exposes `list_profiles`, `list_namespaces`, `list_tables`,
+    `describe_table`, and `query` tools to MCP clients (Claude Desktop,
+    Cline, Continue, …). Configure your client to spawn:
+
+        lakesh mcp
+
+    Reads + writes use the same TOML config the rest of the CLI does.
+    Writes (INSERT / UPDATE / DELETE / DDL) are rejected unless the
+    server is started with `LAKESH_MCP_WRITE=1` in its environment —
+    keeps LLM-driven SQL safe by default.
+    """
+    from .mcp import serve
+    serve()
+
+
+# --------------------------------------------------------------------------
 # doctor — test connectivity against a profile
 
 @app.command()
@@ -197,27 +219,30 @@ def doctor(
 
     ok = True
 
-    # 1. REST `/v1/config`
-    try:
-        r = httpx.get(f"{prof.uri.rstrip('/')}/v1/config", timeout=10.0)
-        r.raise_for_status()
-        console.print(f"[green]✓[/green] REST /v1/config: {r.status_code}")
-    except Exception as e:
-        console.print(f"[red]✗ REST /v1/config: {e}[/red]")
-        ok = False
+    # 1. REST `/v1/config` (iceberg-rest only; ducklake talks straight to PG)
+    if prof.type == "iceberg-rest":
+        try:
+            r = httpx.get(f"{prof.uri.rstrip('/')}/v1/config", timeout=10.0)
+            r.raise_for_status()
+            console.print(f"[green]✓[/green] REST /v1/config: {r.status_code}")
+        except Exception as e:
+            console.print(f"[red]✗ REST /v1/config: {e}[/red]")
+            ok = False
 
     # 2. ATTACH + namespace listing
     try:
         con = connect(prof)
+        catalog = catalog_alias(prof)
         rows = con.execute(
             "SELECT schema_name FROM information_schema.schemata "
-            "WHERE catalog_name='ice' "
+            "WHERE catalog_name = ? "
             "  AND schema_name NOT IN ('main','information_schema','pg_catalog') "
-            "ORDER BY 1"
+            "ORDER BY 1",
+            [catalog],
         ).fetchall()
         console.print(
             f"[green]✓[/green] attach + list: {len(rows)} namespaces "
-            f"{[r[0] for r in rows]}"
+            f"{[r[0] for r in rows]}  (catalog={catalog!r})"
         )
         con.close()
     except Exception as e:

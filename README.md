@@ -1,24 +1,31 @@
 # lakesh
 
-`lakesh` is a DuckDB-powered SQL shell for **Iceberg REST catalogs**.
-Think `snow`-cli but for the lakehouse: profile-based connection
-management, an interactive REPL with SQL autocomplete + history, and a
-one-shot `exec` mode for scripts.
+`lakesh` is a DuckDB-powered SQL shell for **Iceberg REST catalogs and
+DuckLake metastores**. Think `snow`-cli for the lakehouse: profile-based
+connection management, an interactive REPL with SQL autocomplete +
+history, a one-shot `exec` mode for scripts, and an MCP server so LLM
+agents can query your catalogs through the same plumbing.
 
-It's a thin layer on top of DuckDB's `iceberg` extension — DuckDB does
-the heavy lifting (Parquet reads, predicate pushdown, joins); `lakesh`
-handles the ergonomics that the stock `duckdb` CLI doesn't:
+It's a thin layer on top of DuckDB's `iceberg` and `ducklake` extensions
+— DuckDB does the heavy lifting (Parquet reads, predicate pushdown,
+joins); `lakesh` handles the ergonomics that the stock `duckdb` CLI
+doesn't:
 
 - Multiple catalog profiles in a TOML config, switchable via `-p <name>`.
+- Two profile types: **Iceberg REST** (PyIceberg-style endpoint) or
+  **DuckLake direct** (Postgres metadata + S3 data path).
 - OAuth2 token fetch + reuse per session (clients don't have to see JWTs).
 - S3 / MinIO credential plumbing that avoids `duckdb-iceberg`'s known
   path-style + delegation-mode footguns.
 - psql-style `\\l` / `\\d` / `\\timing` / `\\format` meta-commands.
 - Result formatting as rich tables, JSON (for pipes), or CSV.
+- **MCP server** (`lakesh mcp`) exposing `query` / `list_namespaces` /
+  `list_tables` / `describe_table` / `list_profiles` to Claude Desktop,
+  Cline, Continue, etc. Read-only by default for LLM-safety.
 
 Tested against [`duckicelake`](https://github.com/KellerKev/duckicelake);
 should work against any Iceberg REST catalog (Polaris, Nessie,
-Lakekeeper, managed REST, …).
+Lakekeeper, managed REST, …) or any DuckLake catalog.
 
 ## Install
 
@@ -56,7 +63,7 @@ TOML, discovered via (in order):
 2. `$XDG_CONFIG_HOME/lakesh/config.toml`
 3. `~/.config/lakesh/config.toml`
 
-Each profile declares an Iceberg REST catalog + its backing S3:
+### Iceberg REST profile (default)
 
 ```toml
 default = "local"
@@ -77,13 +84,46 @@ client_id     = "demo-client"
 client_secret = "demo-secret"
 ```
 
-**Secrets from env vars** — any `client_id` / `client_secret` /
-`access_key` / `secret_key` can be sourced via a `*_env` sibling:
+The catalog ATTACHes as `ice`, so you query `SELECT * FROM
+ice.<namespace>.<table>`.
+
+### DuckLake direct profile
+
+For local dev or when you want to skip the Iceberg REST layer entirely:
+
+```toml
+[profiles.lake_direct]
+type         = "ducklake"
+postgres_dsn = "dbname=ducklake host=/path/to/.pgsock port=55432 user=ducklake"
+data_path    = "s3://lakehouse/data/"
+catalog      = "lake"          # the AS <name> in ATTACH
+
+[profiles.lake_direct.s3]
+endpoint   = "http://127.0.0.1:9000"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+```
+
+The catalog ATTACHes under the `catalog` name (default `lake`), so
+queries use `SELECT * FROM lake.<schema>.<table>`. Same data as the
+Iceberg REST view of `duckicelake`, but read directly via the
+`ducklake` extension — useful for write workloads (`INSERT` /
+`UPDATE` / `DELETE`) that the iceberg-ext doesn't support.
+
+### Secrets from env vars
+
+Any `client_id` / `client_secret` / `access_key` / `secret_key` /
+`postgres_dsn` can be sourced via a `*_env` sibling:
 
 ```toml
 [profiles.prod.oauth]
 client_id_env     = "LAKESH_PROD_CLIENT_ID"
 client_secret_env = "LAKESH_PROD_CLIENT_SECRET"
+
+[profiles.prod_lake]
+type             = "ducklake"
+postgres_dsn_env = "LAKESH_PROD_PG_DSN"
+data_path        = "s3://prod-bucket/data/"
 ```
 
 Literal values win over env lookups when both are set.
@@ -98,6 +138,7 @@ Literal values win over env lookups when both are set.
 | `lakesh exec -f json -q '<sql>'` | JSON output — machine-readable |
 | `lakesh exec -f csv -q '<sql>'` | CSV output |
 | `lakesh doctor [-p <name>]` | REST + ATTACH + list-namespaces smoke test |
+| `lakesh mcp` | Run as an MCP server on stdio for LLM clients |
 | `lakesh profiles list` | Enumerate configured profiles |
 | `lakesh profiles show <name>` | Dump one profile (secrets redacted) |
 | `lakesh config path` | Print where lakesh will read config from |
@@ -112,6 +153,61 @@ Flags that apply to `run` / `exec` / `doctor`:
 | `-c / --config <path>` | Config file override |
 | `--uri <url>` | Override profile's `uri` (handy for one-off tests) |
 | `--warehouse <name>` | Override profile's `warehouse` |
+
+## MCP server (for LLM agents)
+
+`lakesh mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io)
+server on stdio. Configure your MCP client (Claude Desktop, Cline,
+Continue, …) to spawn it, and the LLM gets these tools:
+
+| Tool | Purpose |
+|---|---|
+| `list_profiles()` | Discover what catalogs are configured |
+| `list_namespaces(profile=None)` | List schemas in a profile's catalog |
+| `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
+| `describe_table(namespace, table, profile=None)` | Columns + types + nullability |
+| `query(sql, profile=None, limit=1000, format="json")` | Run SQL and return results |
+
+### Read-only by default
+
+`query` rejects anything that doesn't start with
+`SELECT` / `SHOW` / `DESCRIBE` / `WITH` / `EXPLAIN` / `PRAGMA` / `VALUES`.
+Set `LAKESH_MCP_WRITE=1` in the server's environment to enable
+INSERT / UPDATE / DELETE / DDL / `CALL ducklake_…` procedures. Keeps
+LLM-driven SQL safe by default.
+
+### Claude Desktop config example
+
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "lakesh": {
+      "command": "lakesh",
+      "args": ["mcp"],
+      "env": {
+        "LAKESH_CONFIG": "/Users/you/.config/lakesh/config.toml"
+      }
+    }
+  }
+}
+```
+
+To enable writes (use carefully — this gives the LLM destructive
+ability):
+
+```json
+"env": {
+  "LAKESH_CONFIG": "/Users/you/.config/lakesh/config.toml",
+  "LAKESH_MCP_WRITE": "1"
+}
+```
+
+### Cline / Continue / other MCP clients
+
+Same shape — point them at the `lakesh mcp` command. The server speaks
+stdio MCP per the spec.
 
 ## REPL meta-commands
 
@@ -139,13 +235,15 @@ lakesh/
 ├── README.md
 ├── example.config.toml
 ├── src/lakesh/
-│   ├── config.py        # TOML loader + profile dataclass + env indirection
-│   ├── duck.py          # DuckDB connect + iceberg ATTACH + OAuth token fetch
+│   ├── config.py        # TOML loader + Profile dataclass + env indirection
+│   ├── duck.py          # DuckDB connect: dispatches iceberg-rest vs ducklake
 │   ├── output.py        # rich table / json / csv formatters
 │   ├── repl.py          # prompt_toolkit REPL + meta-commands
+│   ├── mcp.py           # FastMCP server: query / list_* / describe_table tools
 │   └── cli.py           # typer-based entry points
 └── tests/
-    ├── test_config.py        # config parsing (no network)
+    ├── test_config.py        # config parsing (iceberg-rest + ducklake)
+    ├── test_mcp.py           # MCP tools + read-only safety gate
     └── test_integration.py   # live query against a running catalog (auto-skips)
 ```
 

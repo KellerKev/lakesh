@@ -1,31 +1,39 @@
 """Profile + config loading.
 
 Config lives at `$LAKESH_CONFIG` if set, else `$XDG_CONFIG_HOME/lakesh/config.toml`,
-else `~/.config/lakesh/config.toml`. The file holds named *profiles*, one per
-Iceberg REST catalog the user connects to, plus a `default` pointer.
+else `~/.config/lakesh/config.toml`. The file holds named *profiles* plus a
+`default` pointer.
 
-Schema (TOML):
+Two profile types are supported:
 
-    default = "local"
+**Iceberg REST catalog** (`type = "iceberg-rest"`, default):
 
     [profiles.local]
-    type     = "iceberg-rest"        # (currently the only type)
-    uri      = "http://127.0.0.1:8181"
+    uri       = "http://127.0.0.1:8181"
     warehouse = "lake"
 
     [profiles.local.s3]
     endpoint    = "http://127.0.0.1:9000"
-    region      = "us-east-1"
     access_key  = "minioadmin"
     secret_key  = "minioadmin"
-    path_style  = true
 
-    [profiles.local.oauth]
+    [profiles.local.oauth]           # optional
     client_id     = "demo-client"
     client_secret = "demo-secret"
-    # or reference env:
-    # client_id_env     = "LAKESH_CLIENT_ID"
-    # client_secret_env = "LAKESH_CLIENT_SECRET"
+
+**DuckLake direct** (`type = "ducklake"`) — bypasses the Iceberg REST layer
+and talks to DuckLake's Postgres metadata + S3 data path directly:
+
+    [profiles.lake_direct]
+    type         = "ducklake"
+    postgres_dsn = "dbname=ducklake host=/tmp/.pgsock port=55432 user=ducklake"
+    data_path    = "s3://lakehouse/data/"
+    catalog      = "lake"            # the `AS <name>` in ATTACH
+
+    [profiles.lake_direct.s3]
+    endpoint   = "http://127.0.0.1:9000"
+    access_key = "minioadmin"
+    secret_key = "minioadmin"
 
 Env-var indirection (`*_env` keys) keeps secrets out of the file. Any value
 can also be overridden per-invocation via `--uri`, `--warehouse`, etc. on
@@ -65,25 +73,47 @@ class OAuthConfig:
         return bool(self.client_id and self.client_secret)
 
 
+SUPPORTED_TYPES = ("iceberg-rest", "ducklake")
+
+
 @dataclass
 class Profile:
     name: str
     type: str = "iceberg-rest"
+    # iceberg-rest fields
     uri: str = ""
     warehouse: str = ""
+    # ducklake fields
+    postgres_dsn: str = ""
+    data_path: str = ""
+    catalog: str = "lake"          # ATTACH alias for ducklake profiles
+    # shared
     s3: S3Config = field(default_factory=S3Config)
     oauth: OAuthConfig = field(default_factory=OAuthConfig)
 
     def validate(self) -> None:
-        if self.type != "iceberg-rest":
+        if self.type not in SUPPORTED_TYPES:
             raise ConfigError(
                 f"profile {self.name!r}: unknown type {self.type!r} "
-                f"(supported: iceberg-rest)"
+                f"(supported: {', '.join(SUPPORTED_TYPES)})"
             )
-        if not self.uri:
-            raise ConfigError(f"profile {self.name!r}: missing `uri`")
-        if not self.warehouse:
-            raise ConfigError(f"profile {self.name!r}: missing `warehouse`")
+        if self.type == "iceberg-rest":
+            if not self.uri:
+                raise ConfigError(f"profile {self.name!r}: missing `uri`")
+            if not self.warehouse:
+                raise ConfigError(f"profile {self.name!r}: missing `warehouse`")
+        elif self.type == "ducklake":
+            if not self.postgres_dsn:
+                raise ConfigError(
+                    f"profile {self.name!r}: ducklake profile requires "
+                    f"`postgres_dsn` (e.g. "
+                    f'"dbname=ducklake host=/tmp/.pgsock port=55432 user=ducklake")'
+                )
+            if not self.data_path:
+                raise ConfigError(
+                    f"profile {self.name!r}: ducklake profile requires "
+                    f"`data_path` (e.g. \"s3://bucket/prefix/\")"
+                )
 
 
 @dataclass
@@ -158,11 +188,17 @@ def _parse_profile(name: str, raw: dict) -> Profile:
             oauth_raw.get("client_secret"), oauth_raw.get("client_secret_env")
         ),
     )
+    # DuckLake profiles can stash the Postgres password in an env var
+    # rather than baking it into the DSN string committed to config.
+    postgres_dsn = _resolve_env(raw.get("postgres_dsn"), raw.get("postgres_dsn_env")) or ""
     p = Profile(
         name=name,
         type=str(raw.get("type", "iceberg-rest")),
         uri=str(raw.get("uri", "")),
         warehouse=str(raw.get("warehouse", "")),
+        postgres_dsn=str(postgres_dsn or ""),
+        data_path=str(raw.get("data_path", "")),
+        catalog=str(raw.get("catalog", "lake")),
         s3=s3,
         oauth=oauth,
     )
@@ -205,10 +241,13 @@ def write_example_config(path: Path) -> None:
 
 
 _EXAMPLE = """\
-# lakesh config — profiles for Iceberg REST catalogs. Switch between them
-# via `lakesh -p <name>` or by setting `default` below.
+# lakesh config — profiles for Iceberg REST catalogs and/or DuckLake
+# metastores. Switch between them via `lakesh -p <name>` or by setting
+# `default` below.
 
 default = "local"
+
+# --- Iceberg REST profile (default) --------------------------------------
 
 [profiles.local]
 # Local duckicelake (or any Iceberg REST catalog) running on the laptop.
@@ -227,7 +266,22 @@ path_style = true
 # client_id     = "demo-client"
 # client_secret = "demo-secret"
 
-# Example production profile using environment-backed secrets.
+# --- DuckLake direct profile (bypass the Iceberg REST layer) -------------
+# Useful for INSERT/UPDATE/DELETE workloads that the iceberg-ext can't do.
+# Same underlying data as `local`, just via the ducklake extension.
+
+# [profiles.lake_direct]
+# type         = "ducklake"
+# postgres_dsn = "dbname=ducklake host=/tmp/.pgsock port=55432 user=ducklake"
+# data_path    = "s3://lakehouse/data/"
+# catalog      = "lake"
+#
+# [profiles.lake_direct.s3]
+# endpoint   = "http://127.0.0.1:9000"
+# access_key = "minioadmin"
+# secret_key = "minioadmin"
+
+# --- Production example with env-backed secrets --------------------------
 # [profiles.prod]
 # uri       = "https://catalog.prod.example.com"
 # warehouse = "prod"

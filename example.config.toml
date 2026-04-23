@@ -3,6 +3,8 @@
 
 default = "local"
 
+# --- Iceberg REST profile (most common) -----------------------------------
+
 [profiles.local]
 uri       = "http://127.0.0.1:8181"
 warehouse = "lake"
@@ -19,7 +21,24 @@ path_style = true
 # client_id     = "demo-client"
 # client_secret = "demo-secret"
 
-# Example production profile using environment-backed secrets.
+# --- DuckLake direct profile (bypass the Iceberg REST layer) --------------
+# Useful for write-heavy workloads, since the duckdb-iceberg extension is
+# read-only today. Same underlying data as the `local` profile above, just
+# via `ducklake:postgres:...` instead of an HTTP catalog.
+
+# [profiles.lake_direct]
+# type         = "ducklake"
+# postgres_dsn = "dbname=ducklake host=/tmp/.pgsock port=55432 user=ducklake"
+# data_path    = "s3://lakehouse/data/"
+# catalog      = "lake"
+#
+# [profiles.lake_direct.s3]
+# endpoint   = "http://127.0.0.1:9000"
+# access_key = "minioadmin"
+# secret_key = "minioadmin"
+
+# --- Production profile using environment-backed secrets ------------------
+
 # [profiles.prod]
 # uri       = "https://catalog.prod.example.com"
 # warehouse = "prod"

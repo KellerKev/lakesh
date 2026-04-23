@@ -26,6 +26,7 @@ dependencies = [
     "rich>=13,<15",
     "prompt-toolkit>=3.0,<4",
     "httpx>=0.27,<1",
+    "mcp>=1.0",                 # FastMCP server (stdio) — `lakesh mcp` entry
     # tomllib is stdlib on 3.11+; no extra dep needed.
 ]
 
