@@ -59,8 +59,8 @@ def _main(
         help="Print version and exit.",
     ),
 ):
-    """When invoked without a subcommand, drop straight into `run`
-    with the default profile — Snowflake-CLI-style."""
+    """When invoked without a subcommand, drop straight into `run` with
+    the default profile — matches what `psql`, `duckdb`, `mysql` do."""
     if ctx.invoked_subcommand is None:
         ctx.invoke(run)
 

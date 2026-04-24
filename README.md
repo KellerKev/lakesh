@@ -1,10 +1,10 @@
 # lakesh
 
 `lakesh` is a DuckDB-powered SQL shell for **Iceberg REST catalogs and
-DuckLake metastores**. Think `snow`-cli for the lakehouse: profile-based
-connection management, an interactive REPL with SQL autocomplete +
-history, a one-shot `exec` mode for scripts, and an MCP server so LLM
-agents can query your catalogs through the same plumbing.
+DuckLake metastores**. Profile-based connection management, an
+interactive REPL with SQL autocomplete + history + `psql`-style
+meta-commands, a one-shot `exec` mode for scripts, and an MCP server so
+LLM agents can query your catalogs through the same plumbing.
 
 It's a thin layer on top of DuckDB's `iceberg` and `ducklake` extensions
 — DuckDB does the heavy lifting (Parquet reads, predicate pushdown,
