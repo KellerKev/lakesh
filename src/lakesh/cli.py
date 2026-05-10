@@ -76,8 +76,12 @@ def run(
     config_path: Optional[Path] = typer.Option(
         None, "-c", "--config", help="Config TOML path (override default discovery)."
     ),
-    uri: Optional[str] = typer.Option(None, help="Override the profile's `uri`."),
-    warehouse: Optional[str] = typer.Option(None, help="Override the profile's `warehouse`."),
+    uri: Optional[str] = typer.Option(
+        None, help="Override the profile's `uri` (Iceberg REST profiles only)."
+    ),
+    warehouse: Optional[str] = typer.Option(
+        None, help="Override the profile's `warehouse` (Iceberg REST profiles only)."
+    ),
 ):
     """Open an interactive REPL against a profile's catalog."""
     from .repl import run_repl
@@ -114,8 +118,12 @@ def exec(
         "table", "-f", "--format",
         help="Output format: table (default) | json | csv.",
     ),
-    uri: Optional[str] = typer.Option(None),
-    warehouse: Optional[str] = typer.Option(None),
+    uri: Optional[str] = typer.Option(
+        None, help="Override the profile's `uri` (Iceberg REST profiles only)."
+    ),
+    warehouse: Optional[str] = typer.Option(
+        None, help="Override the profile's `warehouse` (Iceberg REST profiles only)."
+    ),
 ):
     """Run a single SQL statement against a profile's catalog and exit.
 
@@ -204,9 +212,10 @@ def doctor(
 ):
     """Verify connectivity to the catalog + backing S3.
 
-    Runs a minimal sanity sequence: `/v1/config` REST probe → DuckDB
-    ATTACH → `SELECT schema_name FROM information_schema.schemata`. Good
-    first thing to run after editing config.
+    Runs a minimal sanity sequence: `/v1/config` REST probe for
+    iceberg-rest profiles, then DuckDB ATTACH and
+    `SELECT schema_name FROM information_schema.schemata`. Good first
+    thing to run after editing config.
     """
     import httpx
 

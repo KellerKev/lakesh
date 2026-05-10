@@ -35,9 +35,9 @@ and talks to DuckLake's Postgres metadata + S3 data path directly:
     access_key = "minioadmin"
     secret_key = "minioadmin"
 
-Env-var indirection (`*_env` keys) keeps secrets out of the file. Any value
-can also be overridden per-invocation via `--uri`, `--warehouse`, etc. on
-the CLI.
+Env-var indirection (`*_env` keys) keeps secrets out of the file. The
+`--uri` and `--warehouse` CLI overrides apply to Iceberg REST profiles
+only; DuckLake profiles use `postgres_dsn`, `data_path`, and `catalog`.
 """
 from __future__ import annotations
 

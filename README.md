@@ -107,8 +107,9 @@ secret_key = "minioadmin"
 The catalog ATTACHes under the `catalog` name (default `lake`), so
 queries use `SELECT * FROM lake.<schema>.<table>`. Same data as the
 Iceberg REST view of `duckicelake`, but read directly via the
-`ducklake` extension — useful for write workloads (`INSERT` /
-`UPDATE` / `DELETE`) that the iceberg-ext doesn't support.
+`ducklake` extension — useful for SQL that writes data (`INSERT` /
+`UPDATE` / `DELETE`) because the iceberg-ext doesn't support those
+operations through REST.
 
 ### Secrets from env vars
 
@@ -137,7 +138,7 @@ Literal values win over env lookups when both are set.
 | `lakesh exec -q '<sql>'` | Run one query and exit (table output) |
 | `lakesh exec -f json -q '<sql>'` | JSON output — machine-readable |
 | `lakesh exec -f csv -q '<sql>'` | CSV output |
-| `lakesh doctor [-p <name>]` | REST + ATTACH + list-namespaces smoke test |
+| `lakesh doctor [-p <name>]` | REST (iceberg-rest only) + ATTACH + list-namespaces smoke test |
 | `lakesh mcp` | Run as an MCP server on stdio for LLM clients |
 | `lakesh profiles list` | Enumerate configured profiles |
 | `lakesh profiles show <name>` | Dump one profile (secrets redacted) |
@@ -151,8 +152,8 @@ Flags that apply to `run` / `exec` / `doctor`:
 |---|---|
 | `-p / --profile <name>` | Profile to use (defaults to `default` in config) |
 | `-c / --config <path>` | Config file override |
-| `--uri <url>` | Override profile's `uri` (handy for one-off tests) |
-| `--warehouse <name>` | Override profile's `warehouse` |
+| `--uri <url>` | Override profile's `uri` (Iceberg REST profiles only) |
+| `--warehouse <name>` | Override profile's `warehouse` (Iceberg REST profiles only) |
 
 ## MCP server (for LLM agents)
 
