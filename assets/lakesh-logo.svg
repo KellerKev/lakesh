@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 400" width="800" height="400" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#cfeaff"/>
+      <stop offset="100%" stop-color="#ffe6c2"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5fb3d6"/>
+      <stop offset="100%" stop-color="#1e6a8c"/>
+    </linearGradient>
+    <linearGradient id="iceTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#bfe5f5"/>
+    </linearGradient>
+    <linearGradient id="iceBot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8ec9dc"/>
+      <stop offset="100%" stop-color="#2f7a96"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff2a8"/>
+      <stop offset="100%" stop-color="#ffcf6b"/>
+    </radialGradient>
+    <linearGradient id="hull" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#c0432e"/>
+      <stop offset="100%" stop-color="#7a2418"/>
+    </linearGradient>
+  </defs>
+
+  <!-- sky -->
+  <rect width="800" height="240" fill="url(#sky)"/>
+  <circle cx="660" cy="80" r="42" fill="url(#sun)"/>
+
+  <!-- distant mountains -->
+  <path d="M0,200 L120,130 L220,200 Z" fill="#9bb7c6" opacity="0.6"/>
+  <path d="M180,200 L320,110 L460,200 Z" fill="#7a9caf" opacity="0.55"/>
+  <path d="M420,200 L560,140 L700,200 Z" fill="#9bb7c6" opacity="0.55"/>
+
+  <!-- ICEBERG in background, smaller, off-center to give the boat the stage -->
+  <polygon points="540,230 600,140 660,230" fill="url(#iceTop)" stroke="#7fb6cf" stroke-width="1"/>
+  <polygon points="600,140 660,230 630,230 610,180" fill="#a8d6e6" opacity="0.7"/>
+
+  <!-- water -->
+  <rect y="240" width="800" height="160" fill="url(#water)"/>
+  <!-- submerged iceberg mass -->
+  <polygon points="520,240 680,240 650,320 550,320" fill="url(#iceBot)" opacity="0.85"/>
+  <line x1="520" y1="240" x2="680" y2="240" stroke="#ffffff" stroke-width="2" opacity="0.6"/>
+
+  <!-- water ripples -->
+  <path d="M30,290 q20,-6 40,0 t40,0 t40,0" stroke="#bde3f1" stroke-width="2" fill="none" opacity="0.7"/>
+  <path d="M60,350 q20,-6 40,0 t40,0" stroke="#bde3f1" stroke-width="2" fill="none" opacity="0.6"/>
+  <path d="M620,360 q20,-6 40,0 t40,0" stroke="#bde3f1" stroke-width="2" fill="none" opacity="0.6"/>
+
+  <!-- BOAT in the foreground (left-center) -->
+  <g transform="translate(220,260)">
+    <!-- hull -->
+    <path d="M-110,30 L110,30 L90,70 L-90,70 Z" fill="url(#hull)" stroke="#4a1209" stroke-width="1.5"/>
+    <!-- hull stripe -->
+    <rect x="-100" y="34" width="200" height="6" fill="#f4ecd8"/>
+    <!-- cabin -->
+    <rect x="-40" y="-10" width="80" height="40" fill="#f4ecd8" stroke="#4a1209" stroke-width="1.5"/>
+    <!-- cabin roof -->
+    <rect x="-46" y="-16" width="92" height="8" fill="#7a2418"/>
+    <!-- cabin window -->
+    <rect x="-30" y="0" width="22" height="18" fill="#9fd6ee" stroke="#4a1209" stroke-width="1"/>
+    <rect x="8" y="0" width="22" height="18" fill="#9fd6ee" stroke="#4a1209" stroke-width="1"/>
+    <!-- smokestack -->
+    <rect x="50" y="-30" width="14" height="20" fill="#222"/>
+    <rect x="48" y="-32" width="18" height="4" fill="#444"/>
+    <!-- smoke puffs -->
+    <circle cx="60" cy="-44" r="6" fill="#ffffff" opacity="0.85"/>
+    <circle cx="72" cy="-54" r="8" fill="#ffffff" opacity="0.7"/>
+    <circle cx="88" cy="-66" r="10" fill="#ffffff" opacity="0.55"/>
+    <!-- flag pole -->
+    <line x1="-46" y1="-16" x2="-46" y2="-50" stroke="#3a3a3a" stroke-width="2"/>
+    <polygon points="-46,-50 -22,-44 -46,-38" fill="#e85a7a"/>
+
+    <!-- DUCK CAPTAIN at the helm, on top of cabin (left side) -->
+    <g transform="translate(-22,-28)">
+      <!-- ship's wheel behind/under the duck -->
+      <g transform="translate(18,8)">
+        <circle r="11" fill="none" stroke="#6b3a17" stroke-width="2.5"/>
+        <circle r="3" fill="#6b3a17"/>
+        <line x1="-11" y1="0" x2="-17" y2="0" stroke="#6b3a17" stroke-width="2.5"/>
+        <line x1="11" y1="0" x2="17" y2="0" stroke="#6b3a17" stroke-width="2.5"/>
+        <line x1="0" y1="-11" x2="0" y2="-17" stroke="#6b3a17" stroke-width="2.5"/>
+        <line x1="0" y1="11" x2="0" y2="17" stroke="#6b3a17" stroke-width="2.5"/>
+        <line x1="-8" y1="-8" x2="-12" y2="-12" stroke="#6b3a17" stroke-width="2"/>
+        <line x1="8" y1="-8" x2="12" y2="-12" stroke="#6b3a17" stroke-width="2"/>
+        <line x1="-8" y1="8" x2="-12" y2="12" stroke="#6b3a17" stroke-width="2"/>
+        <line x1="8" y1="8" x2="12" y2="12" stroke="#6b3a17" stroke-width="2"/>
+      </g>
+      <!-- duck body -->
+      <ellipse cx="0" cy="8" rx="22" ry="11" fill="#f7d04a"/>
+      <!-- wing -->
+      <path d="M-6,4 q10,-8 18,2 q-9,5 -18,-2 z" fill="#e8b624"/>
+      <!-- head -->
+      <circle cx="14" cy="-4" r="11" fill="#f7d04a"/>
+      <!-- captain's hat -->
+      <rect x="6" y="-15" width="18" height="5" fill="#1a1a1a"/>
+      <rect x="8" y="-22" width="14" height="7" fill="#1a1a1a"/>
+      <rect x="8" y="-15" width="14" height="2" fill="#f4ecd8"/>
+      <!-- gold hat badge -->
+      <circle cx="15" cy="-18" r="1.6" fill="#ffd24a"/>
+      <!-- beak -->
+      <polygon points="24,-4 36,-2 24,3" fill="#ff8c2a"/>
+      <!-- eye -->
+      <circle cx="17" cy="-6" r="1.8" fill="#222"/>
+      <!-- happy smile curl -->
+      <path d="M12,14 q5,3 11,0" stroke="#d99a2b" stroke-width="1.4" fill="none"/>
+    </g>
+  </g>
+
+  <!-- two ducklings paddling alongside (foreground) -->
+  <g transform="translate(420,340)">
+    <ellipse cx="0" cy="6" rx="20" ry="8" fill="#f7d04a"/>
+    <circle cx="15" cy="-2" r="8" fill="#f7d04a"/>
+    <polygon points="22,-2 32,0 22,3" fill="#ff8c2a"/>
+    <circle cx="17" cy="-4" r="1.6" fill="#222"/>
+    <path d="M12,10 q4,2 8,0" stroke="#d99a2b" stroke-width="1.2" fill="none"/>
+    <ellipse cx="0" cy="16" rx="24" ry="2" fill="#ffffff" opacity="0.4"/>
+  </g>
+  <g transform="translate(470,360) scale(-1,1)">
+    <ellipse cx="0" cy="6" rx="18" ry="7" fill="#f7d04a"/>
+    <circle cx="14" cy="-2" r="7" fill="#f7d04a"/>
+    <polygon points="20,-2 29,0 20,3" fill="#ff8c2a"/>
+    <circle cx="16" cy="-4" r="1.4" fill="#222"/>
+    <path d="M11,9 q3,2 7,0" stroke="#d99a2b" stroke-width="1.2" fill="none"/>
+    <ellipse cx="0" cy="15" rx="22" ry="2" fill="#ffffff" opacity="0.4"/>
+  </g>
+
+  <!-- hearts to match duckicelake mood -->
+  <text x="220" y="195" font-size="14" fill="#e85a7a">♥</text>
+  <text x="440" y="320" font-size="12" fill="#e85a7a">♥</text>
+
+  <!-- wordmark -->
+  <text x="400" y="388" text-anchor="middle" font-size="22" font-weight="700" fill="#ffffff" letter-spacing="2">
+    lakesh
+  </text>
+</svg>

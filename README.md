@@ -1,5 +1,9 @@
 # lakesh
 
+<p align="center">
+  <img src="assets/lakesh-logo.svg" alt="lakesh — duck captain steering a tugboat across the duckicelake" width="640"/>
+</p>
+
 `lakesh` is a DuckDB-powered SQL shell for **Iceberg REST catalogs and
 DuckLake metastores**. Profile-based connection management, an
 interactive REPL with SQL autocomplete + history + `psql`-style
