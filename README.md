@@ -27,6 +27,17 @@ Tested against [`duckicelake`](https://github.com/KellerKev/duckicelake);
 should work against any Iceberg REST catalog (Polaris, Nessie,
 Lakekeeper, managed REST, …) or any DuckLake catalog.
 
+## Demo
+
+REPL session against a local `duckicelake` catalog — profile switching,
+`\d` / `\l` meta-commands, autocomplete, and a query through the
+Iceberg REST → DuckDB iceberg-ext path.
+
+![lakesh demo](demo_videos/lakesh-companion-demo.gif)
+
+📥 Full quality:
+[`lakesh-companion-demo.mp4`](demo_videos/lakesh-companion-demo.mp4)
+
 ## Install
 
 ```bash
