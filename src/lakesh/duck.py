@@ -58,27 +58,34 @@ def _host_without_scheme(endpoint: str) -> str:
 def _install_s3_secret(con: duckdb.DuckDBPyConnection, profile: Profile) -> None:
     """Shared helper — creates an `ice_s3` secret when the profile
     supplies access+secret keys. Used by both profile types for
-    data-file reads from MinIO / S3."""
+    data-file reads from MinIO / S3. STS temporary credentials (e.g.
+    duckicelake's vended ducklake-credentials) also carry a session
+    token, which DuckDB needs in the secret or MinIO rejects the key."""
     s3 = profile.s3
     if not (s3.access_key and s3.secret_key):
         return
+    params = [
+        s3.access_key,
+        s3.secret_key,
+        s3.region,
+        _host_without_scheme(s3.endpoint) if s3.endpoint else "",
+        bool(s3.endpoint and s3.endpoint.startswith("https://")),
+        "path" if s3.path_style else "vhost",
+    ]
+    session_clause = ""
+    if s3.session_token:
+        session_clause = "SESSION_TOKEN ?,"
+        params.insert(2, s3.session_token)
     con.execute(
-        """
+        f"""
         CREATE OR REPLACE SECRET ice_s3 (
             TYPE S3,
-            KEY_ID ?, SECRET ?,
+            KEY_ID ?, SECRET ?, {session_clause}
             REGION ?, ENDPOINT ?,
             USE_SSL ?, URL_STYLE ?
         )
         """,
-        [
-            s3.access_key,
-            s3.secret_key,
-            s3.region,
-            _host_without_scheme(s3.endpoint) if s3.endpoint else "",
-            bool(s3.endpoint and s3.endpoint.startswith("https://")),
-            "path" if s3.path_style else "vhost",
-        ],
+        params,
     )
 
 
