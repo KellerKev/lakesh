@@ -44,6 +44,23 @@ Iceberg REST → DuckDB iceberg-ext path.
 
 ## Install
 
+With [pixi](https://pixi.sh) (recommended — manages Python for you):
+
+```bash
+pixi install            # create the env + install lakesh (editable)
+pixi run lakesh         # drop into the REPL
+pixi run -e dev test    # run the test suite
+```
+
+Or a quick global install — puts `lakesh` on your PATH, no env to activate:
+
+```bash
+pixi global install --path .
+lakesh --help           # works from anywhere
+```
+
+Plain pip also works:
+
 ```bash
 pip install -e '.[dev]'
 ```
