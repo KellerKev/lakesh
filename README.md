@@ -27,8 +27,11 @@ doesn't:
   `list_tables` / `describe_table` / `list_profiles` to Claude Desktop,
   Cline, Continue, etc. Read-only by default for LLM-safety.
 
-Tested against [`duckicelake`](https://github.com/KellerKev/duckicelake);
-should work against any Iceberg REST catalog (Polaris, Nessie,
+Built as the companion CLI for
+[`duckicelake`](https://github.com/KellerKev/duckicelake) — a governed
+Iceberg REST catalog on DuckLake with byte-level PII masking and
+credential vending (see [Pairs with duckicelake](#pairs-with-duckicelake))
+— and works against any Iceberg REST catalog (Polaris, Nessie,
 Lakekeeper, managed REST, …) or any DuckLake catalog.
 
 ## Demo
@@ -41,6 +44,41 @@ Iceberg REST → DuckDB iceberg-ext path.
 
 📥 Full quality:
 [`lakesh-companion-demo.mp4`](demo_videos/lakesh-companion-demo.mp4)
+
+## Pairs with duckicelake
+
+[`duckicelake`](https://github.com/KellerKev/duckicelake) is the governed
+half of this pairing: an Iceberg REST catalog on DuckLake with tag-based
+RBAC, column masking and row policies **enforced down to the bytes on
+object storage**, scoped credential vending, and an audit trail for every
+read. `lakesh` is the front door — for humans at the REPL and for LLM
+agents over MCP.
+
+What the pairing gives you:
+
+- **Governed queries with zero client changes.** Point an `iceberg-rest`
+  profile at the proxy (`uri = "http://127.0.0.1:8181"`) and your reads
+  carry your principal's masking/row policies. OAuth2 token minting is
+  built in — set `[profiles.<name>.oauth]` and lakesh fetches/reuses the
+  JWT per session.
+- **Vended-credential sessions.** duckicelake's
+  `ducklake-credentials` endpoint vends a reader DSN plus prefix-scoped
+  STS credentials; lakesh's `ducklake` profile type accepts the vended
+  `session_token` directly (that's why the field exists), so a governed
+  DuckLake-direct session is just a profile away — masked view,
+  row-level security and all.
+- **Agents can't see PII — by construction.** `lakesh mcp` is read-only
+  by default (writes require `LAKESH_MCP_WRITE=1`), and duckicelake masks
+  and audits every read for a principal without the `unmasked-roles`
+  bypass. Wire Claude Desktop to `lakesh mcp`, hand it a governed token,
+  and it reads `al***` where a privileged analyst reads the real value —
+  same API, every access audited. The full story:
+  [duckicelake's ecosystem section](https://github.com/KellerKev/duckicelake#the-ecosystem-duckicelake--lakesh--agents).
+
+Try the pairing end-to-end: in the duckicelake repo, `pixi run demo`
+authors the policies, then `pixi run demo-lakesh` runs this exact flow —
+an unmasked REST read vs the vended masked view — through lakesh (the
+recording above is that demo).
 
 ## Install
 
