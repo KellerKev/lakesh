@@ -198,6 +198,8 @@ goes further and ATTACHes the source as a catalog, so autocomplete,
 [profiles.pg]
 type      = "adbc"
 driver    = "postgresql"    # manifest name or full path to the driver lib
+# URI shape: postgresql://USERNAME:PASSWORD@HOST:PORT/DATABASE
+# (username `reporting`, password `hunter2`; URL-encode special chars)
 uri       = "postgresql://reporting:hunter2@db.example.com:5432/appdb"
 catalog   = "pg"            # tables appear as pg.<schema>.<table>
 read_only = true            # optional

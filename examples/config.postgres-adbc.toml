@@ -15,9 +15,15 @@ default = "pg"
 [profiles.pg]
 type      = "adbc"
 driver    = "postgresql"
-# The postgresql ADBC driver takes credentials in the URI. A password in
-# the config file is fine; use `uri_env` instead if you'd rather source
-# the whole DSN from an env var (literal `uri` wins if both are set).
+# The postgresql ADBC driver takes credentials in the URI:
+#
+#   postgresql://USERNAME:PASSWORD@HOST:PORT/DATABASE
+#                └──┬───┘ └──┬───┘
+#             pg username  pg password (URL-encode special chars, e.g. @ → %40)
+#
+# Here USERNAME=reporting and PASSWORD=hunter2. A password in the config
+# file is fine; use `uri_env` instead if you'd rather source the whole
+# DSN from an env var (literal `uri` wins if both are set).
 uri       = "postgresql://reporting:hunter2@db.example.com:5432/appdb"
 # uri_env = "LAKESH_PG_DSN"
 catalog   = "pg"          # tables appear as pg.<schema>.<table>
