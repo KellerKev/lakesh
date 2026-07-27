@@ -268,3 +268,284 @@ warehouse = "w"
 """)
     with pytest.raises(ConfigError, match="unknown type"):
         load_config(p)
+
+
+# --------------------------------------------------------------------------
+# adbc profiles
+
+def test_adbc_profile_parses(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.pg]
+type      = "adbc"
+driver    = "postgresql"
+uri       = "postgresql://db:5432/app"
+catalog   = "pg"
+read_only = true
+token_option = "auth_token"
+
+[profiles.pg.options]
+username = "u"
+password = "pw"
+"adbc.postgresql.some_key" = "v"
+""")
+    prof = load_config(p).get("pg")
+    assert prof.type == "adbc"
+    assert prof.driver == "postgresql"
+    assert prof.uri == "postgresql://db:5432/app"
+    assert prof.catalog == "pg"
+    assert prof.read_only is True
+    assert prof.token_option == "auth_token"
+    assert prof.options == {
+        "username": "u",
+        "password": "pw",
+        "adbc.postgresql.some_key": "v",
+    }
+
+
+def test_adbc_catalog_defaults_to_src(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.a]
+type   = "adbc"
+driver = "sqlite"
+uri    = "/tmp/x.db"
+""")
+    prof = load_config(p).get("a")
+    assert prof.catalog == "src"
+    assert prof.read_only is False
+
+
+def test_adbc_missing_driver_errors(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.a]
+type = "adbc"
+uri  = "/tmp/x.db"
+""")
+    with pytest.raises(ConfigError, match="requires `driver`"):
+        load_config(p)
+
+
+def test_adbc_bad_catalog_identifier_errors(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.a]
+type    = "adbc"
+driver  = "sqlite"
+uri     = "/tmp/x.db"
+catalog = "bad-name; DROP"
+""")
+    with pytest.raises(ConfigError, match="plain identifier"):
+        load_config(p)
+
+
+def test_adbc_options_env_indirection(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LAKESH_TEST_PW", "s3cret")
+    p = _write(tmp_path, """
+[profiles.a]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://h:5432/db"
+
+[profiles.a.options]
+username     = "u"
+password_env = "LAKESH_TEST_PW"
+""")
+    prof = load_config(p).get("a")
+    assert prof.options["password"] == "s3cret"
+    assert "password_env" not in prof.options
+
+
+def test_adbc_options_literal_wins_over_env(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LAKESH_TEST_PW", "from_env")
+    p = _write(tmp_path, """
+[profiles.a]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://h:5432/db"
+
+[profiles.a.options]
+password     = "literal"
+password_env = "LAKESH_TEST_PW"
+""")
+    assert load_config(p).get("a").options["password"] == "literal"
+
+
+def test_adbc_oauth_without_token_option_errors(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.a]
+type   = "adbc"
+driver = "snowflake"
+
+[profiles.a.oauth]
+grant                         = "device_code"
+client_id                     = "cid"
+device_authorization_endpoint = "https://idp/device"
+token_endpoint                = "https://idp/token"
+""")
+    with pytest.raises(ConfigError, match="token_option"):
+        load_config(p)
+
+
+def test_adbc_oauth_with_token_placeholder_ok(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.a]
+type   = "adbc"
+driver = "flightsql"
+uri    = "grpc://h:31337"
+
+[profiles.a.options]
+"adbc.flight.sql.authorization_header" = "Bearer {token}"
+
+[profiles.a.oauth]
+grant                         = "device_code"
+client_id                     = "cid"
+device_authorization_endpoint = "https://idp/device"
+token_endpoint                = "https://idp/token"
+""")
+    prof = load_config(p).get("a")
+    assert prof.oauth.grant == "device_code"
+
+
+# --------------------------------------------------------------------------
+# oauth grants
+
+def test_oauth_backwards_compat_two_field_block(tmp_path: Path):
+    """Old configs with only client_id + client_secret keep working:
+    grant defaults to client_credentials and enabled stays True."""
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+client_id = "cid"
+client_secret = "cs"
+""")
+    o = load_config(p).get("p").oauth
+    assert o.grant == "client_credentials"
+    assert o.enabled
+    assert o.token_endpoint is None
+
+
+def test_oauth_client_id_only_stays_disabled_for_cc(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+client_id = "cid"
+""")
+    assert not load_config(p).get("p").oauth.enabled
+
+
+def test_oauth_full_fields_parse(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+grant          = "authorization_code"
+client_id      = "cid"
+authorization_endpoint = "https://idp/authorize"
+token_endpoint = "https://idp/token"
+scope          = "openid offline_access"
+audience       = "https://api"
+redirect_port  = 8912
+
+[profiles.p.oauth.extra]
+resource = "urn:x"
+""")
+    o = load_config(p).get("p").oauth
+    assert o.grant == "authorization_code"
+    assert o.enabled
+    assert o.scope == "openid offline_access"
+    assert o.audience == "https://api"
+    assert o.redirect_port == 8912
+    assert o.extra == {"resource": "urn:x"}
+
+
+def test_oauth_unknown_grant_errors(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+grant     = "implicit"
+client_id = "cid"
+""")
+    with pytest.raises(ConfigError, match="unknown oauth grant"):
+        load_config(p)
+
+
+def test_device_code_requires_device_endpoint(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+grant          = "device_code"
+client_id      = "cid"
+token_endpoint = "https://idp/token"
+""")
+    with pytest.raises(ConfigError, match="device_authorization_endpoint"):
+        load_config(p)
+
+
+def test_authorization_code_requires_auth_endpoint(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+grant          = "authorization_code"
+client_id      = "cid"
+token_endpoint = "https://idp/token"
+""")
+    with pytest.raises(ConfigError, match="authorization_endpoint"):
+        load_config(p)
+
+
+def test_interactive_grant_requires_token_endpoint(tmp_path: Path):
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+grant                         = "device_code"
+client_id                     = "cid"
+device_authorization_endpoint = "https://idp/device"
+""")
+    with pytest.raises(ConfigError, match="token_endpoint"):
+        load_config(p)
+
+
+def test_cc_iceberg_rest_token_endpoint_optional(tmp_path: Path):
+    """client_credentials on iceberg-rest keeps defaulting to the
+    catalog's own /v1/oauth/tokens — no token_endpoint needed."""
+    p = _write(tmp_path, """
+[profiles.p]
+uri = "http://h:1"
+warehouse = "w"
+
+[profiles.p.oauth]
+client_id     = "cid"
+client_secret = "cs"
+""")
+    assert load_config(p).get("p").oauth.enabled
+
+
+def test_adbc_uri_via_env(tmp_path: Path, monkeypatch):
+    """Drivers like postgresql only accept credentials embedded in the
+    URI — uri_env keeps the password-bearing DSN out of the file."""
+    monkeypatch.setenv("LAKESH_TEST_URI_DSN", "postgresql://u:pw@h:5432/db")
+    p = _write(tmp_path, """
+[profiles.a]
+type    = "adbc"
+driver  = "postgresql"
+uri_env = "LAKESH_TEST_URI_DSN"
+""")
+    assert load_config(p).get("a").uri == "postgresql://u:pw@h:5432/db"

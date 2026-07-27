@@ -43,6 +43,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import Config, ConfigError, default_config_path, load_config
 from .duck import catalog_alias, connect
+from .oauth import AuthRequired
 from .output import _stringify  # type: ignore[attr-defined]
 
 
@@ -71,10 +72,17 @@ def _load_or_raise(config_path: Path | None = None) -> Config:
 @contextmanager
 def _open(profile_name: str | None, cfg: Config | None = None) -> Iterator[tuple[duckdb.DuckDBPyConnection, str]]:
     """Resolve profile + ATTACH + yield (connection, catalog_alias).
-    Closes the connection on exit so we never leak DuckDB handles."""
+    Closes the connection on exit so we never leak DuckDB handles.
+
+    Connections are opened with `interactive=False`: an MCP server can't
+    run a browser or device-code login, so profiles on interactive
+    grants need a prior `lakesh auth login` in a terminal. Cached tokens
+    (incl. refresh) keep working here without any prompting; the
+    `AuthRequired` raised otherwise is surfaced to the caller as a JSON
+    error by each tool."""
     cfg = cfg or _load_or_raise()
     prof = cfg.get(profile_name)
-    con = connect(prof)
+    con = connect(prof, interactive=False)
     try:
         yield con, catalog_alias(prof)
     finally:
@@ -127,14 +135,19 @@ server = FastMCP(
 @server.tool()
 def list_profiles() -> str:
     """List all configured catalog profiles. Returns JSON: each entry has
-    `name`, `type` (`iceberg-rest` or `ducklake`), and a one-line
-    `description` of where it points."""
+    `name`, `type` (`iceberg-rest`, `ducklake`, or `adbc`), and a
+    one-line `description` of where it points."""
     cfg = _load_or_raise()
     out = []
     for name in sorted(cfg.profiles):
         p = cfg.profiles[name]
         if p.type == "iceberg-rest":
             desc = f"Iceberg REST {p.uri} (warehouse={p.warehouse})"
+        elif p.type == "adbc":
+            desc = (
+                f"ADBC {p.driver} {p.uri or '(options-configured)'} "
+                f"(catalog={p.catalog})"
+            )
         else:
             desc = f"DuckLake @ {p.data_path} (catalog={p.catalog})"
         out.append({
@@ -150,14 +163,17 @@ def list_profiles() -> str:
 def list_namespaces(profile: str | None = None) -> str:
     """List schemas / namespaces in the catalog. `profile` defaults to
     the config's `default`. Returns JSON array of names."""
-    with _open(profile) as (con, catalog):
-        rows = con.execute(
-            "SELECT schema_name FROM information_schema.schemata "
-            "WHERE catalog_name = ? "
-            "  AND schema_name NOT IN ('main','information_schema','pg_catalog') "
-            "ORDER BY 1",
-            [catalog],
-        ).fetchall()
+    try:
+        with _open(profile) as (con, catalog):
+            rows = con.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                "WHERE catalog_name = ? "
+                "  AND schema_name NOT IN ('main','information_schema','pg_catalog') "
+                "ORDER BY 1",
+                [catalog],
+            ).fetchall()
+    except AuthRequired as e:
+        return json.dumps({"error": str(e)})
     return json.dumps([r[0] for r in rows])
 
 
@@ -168,13 +184,16 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
     q = ("SELECT table_schema, table_name FROM information_schema.tables "
          "WHERE table_catalog = ? "
          "  AND table_schema NOT IN ('main','information_schema','pg_catalog')")
-    with _open(profile) as (con, catalog):
-        params: list = [catalog]
-        if namespace:
-            q += " AND table_schema = ?"
-            params.append(namespace)
-        q += " ORDER BY 1, 2"
-        rows = con.execute(q, params).fetchall()
+    try:
+        with _open(profile) as (con, catalog):
+            params: list = [catalog]
+            if namespace:
+                q += " AND table_schema = ?"
+                params.append(namespace)
+            q += " ORDER BY 1, 2"
+            rows = con.execute(q, params).fetchall()
+    except AuthRequired as e:
+        return json.dumps({"error": str(e)})
     return json.dumps([{"namespace": r[0], "table": r[1]} for r in rows])
 
 
@@ -182,14 +201,17 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
 def describe_table(namespace: str, table: str, profile: str | None = None) -> str:
     """Return a table's columns + types + nullability. JSON array of
     `{column, type, nullable, position}` objects."""
-    with _open(profile) as (con, catalog):
-        rows = con.execute(
-            "SELECT column_name, data_type, is_nullable, ordinal_position "
-            "FROM information_schema.columns "
-            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
-            "ORDER BY ordinal_position",
-            [catalog, namespace, table],
-        ).fetchall()
+    try:
+        with _open(profile) as (con, catalog):
+            rows = con.execute(
+                "SELECT column_name, data_type, is_nullable, ordinal_position "
+                "FROM information_schema.columns "
+                "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
+                "ORDER BY ordinal_position",
+                [catalog, namespace, table],
+            ).fetchall()
+    except AuthRequired as e:
+        return json.dumps({"error": str(e)})
     return json.dumps([
         {"column": r[0], "type": r[1], "nullable": r[2] == "YES", "position": int(r[3])}
         for r in rows
@@ -237,13 +259,16 @@ def query(
     if format not in ("json", "table"):
         return json.dumps({"error": f"unknown format {format!r}"})
 
-    with _open(profile) as (con, _catalog):
-        try:
-            cur = con.execute(sql)
-            columns = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchmany(limit)
-        except duckdb.Error as e:
-            return json.dumps({"error": str(e)})
+    try:
+        with _open(profile) as (con, _catalog):
+            try:
+                cur = con.execute(sql)
+                columns = [d[0] for d in cur.description] if cur.description else []
+                rows = cur.fetchmany(limit)
+            except duckdb.Error as e:
+                return json.dumps({"error": str(e)})
+    except AuthRequired as e:
+        return json.dumps({"error": str(e)})
 
     if not columns:
         return json.dumps({"ok": True, "rows": 0, "note": "no result set"})

@@ -162,12 +162,20 @@ def run_repl(profile: Profile, con: duckdb.DuckDBPyConnection, console: Console)
     """Interactive loop. Returns a process exit code."""
     import time
     catalog = catalog_alias(profile)
-    banner_tail = (
-        f"[cyan]{profile.uri}[/cyan], warehouse [cyan]{profile.warehouse}[/cyan]"
-        if profile.type == "iceberg-rest"
-        else f"DuckLake @ [cyan]{profile.data_path}[/cyan] "
-             f"(catalog [cyan]{catalog}[/cyan])"
-    )
+    if profile.type == "iceberg-rest":
+        banner_tail = (
+            f"[cyan]{profile.uri}[/cyan], warehouse [cyan]{profile.warehouse}[/cyan]"
+        )
+    elif profile.type == "adbc":
+        banner_tail = (
+            f"ADBC [cyan]{profile.driver}[/cyan] "
+            f"(catalog [cyan]{catalog}[/cyan])"
+        )
+    else:
+        banner_tail = (
+            f"DuckLake @ [cyan]{profile.data_path}[/cyan] "
+            f"(catalog [cyan]{catalog}[/cyan])"
+        )
     console.print(
         f"[bold green]lakesh[/bold green] connected to [bold]{profile.name}[/bold] "
         f"({banner_tail})"

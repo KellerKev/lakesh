@@ -1,0 +1,32 @@
+# Example lakesh config: querying a Postgres database through ADBC.
+# Everything here is fake — swap in your own host, database, and password.
+#
+# Setup:
+#   1. Install the driver:            dbc install postgresql
+#      (or point `driver` at a libadbc_driver_postgresql shared library)
+#   2. Copy this file:                cp examples/config.postgres-adbc.toml \
+#                                        ~/.config/lakesh/config.toml
+#   3. Check connectivity:            lakesh doctor
+#   4. Query away:                    lakesh exec -q 'SELECT * FROM pg.public.users LIMIT 5'
+#      or drop into the REPL:         lakesh
+
+default = "pg"
+
+[profiles.pg]
+type      = "adbc"
+driver    = "postgresql"
+# The postgresql ADBC driver takes credentials in the URI. A password in
+# the config file is fine; use `uri_env` instead if you'd rather source
+# the whole DSN from an env var (literal `uri` wins if both are set).
+uri       = "postgresql://reporting:hunter2@db.example.com:5432/appdb"
+# uri_env = "LAKESH_PG_DSN"
+catalog   = "pg"          # tables appear as pg.<schema>.<table>
+read_only = true          # drop this to allow adbc_execute()/adbc_insert()
+
+# A second profile against the same server's staging database — switch
+# with `lakesh -p staging`.
+[profiles.staging]
+type    = "adbc"
+driver  = "postgresql"
+uri     = "postgresql://reporting:hunter2@db.example.com:5432/staging"
+catalog = "stg"

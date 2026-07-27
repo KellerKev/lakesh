@@ -162,3 +162,33 @@ def test_query_truncates_at_limit(config_file):
     out = json.loads(lakesh_mcp.query(sql, limit=3))
     assert out["row_count"] == 3
     assert out["truncated_at"] == 3
+
+
+# --------------------------------------------------------------------------
+# AuthRequired surfacing (no catalog needed)
+
+
+def test_query_surfaces_auth_required(tmp_path: Path, monkeypatch):
+    """A profile on an interactive grant with an empty token cache must
+    return an actionable JSON error, not hang or crash."""
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "snow"
+
+[profiles.snow]
+type         = "adbc"
+driver       = "snowflake"
+token_option = "auth_token"
+
+[profiles.snow.oauth]
+grant                         = "device_code"
+client_id                     = "cid"
+device_authorization_endpoint = "https://idp.invalid/device"
+token_endpoint                = "https://idp.invalid/token"
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    monkeypatch.setenv("LAKESH_TOKEN_CACHE", str(tmp_path / "tokens.json"))
+
+    out = json.loads(lakesh_mcp.query("SELECT 1"))
+    assert "error" in out
+    assert "lakesh auth login -p snow" in out["error"]

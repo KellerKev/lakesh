@@ -50,3 +50,48 @@ path_style = true
 # [profiles.prod.oauth]
 # client_id_env     = "LAKESH_PROD_CLIENT_ID"
 # client_secret_env = "LAKESH_PROD_CLIENT_SECRET"
+# # Or point at an external IdP with scope/audience:
+# # token_endpoint = "https://idp.example.com/oauth2/token"
+# # scope          = "catalog:read catalog:write"
+
+# --- ADBC profile: query any database with an ADBC driver -----------------
+# Uses the adbc_scanner DuckDB community extension (loaded automatically).
+# Install drivers with the `dbc` CLI (https://dbc.columnar.tech):
+#     dbc install postgresql
+# `driver` accepts a manifest name or a full path to the shared library.
+
+# The postgresql driver takes credentials in the URI (it rejects
+# username/password options). A password in the config file is fine, or
+# use `uri_env` to source the whole DSN from an env var instead.
+# Drivers that do support option-based auth (e.g. flightsql) can use an
+# [profiles.X.options] table with username / password_env keys.
+
+# [profiles.pg]
+# type      = "adbc"
+# driver    = "postgresql"
+# uri       = "postgresql://reporting:s3cret@db.example.com:5432/appdb"
+# # uri_env = "LAKESH_PG_DSN"    # alternative; literal `uri` wins if both set
+# catalog   = "pg"            # tables appear as pg.<schema>.<table>
+# read_only = true
+
+# --- ADBC + OAuth2 device-code login (e.g. Snowflake via an IdP) ----------
+# Run `lakesh auth login -p snow` once; tokens are cached + refreshed in
+# $XDG_STATE_HOME/lakesh/tokens.json. Grants: client_credentials |
+# device_code | authorization_code (PKCE, opens your browser).
+
+# [profiles.snow]
+# type         = "adbc"
+# driver       = "snowflake"
+# catalog      = "snow"
+# token_option = "adbc.snowflake.sql.client_option.auth_token"
+#
+# [profiles.snow.options]
+# "adbc.snowflake.sql.account" = "myorg-account1"
+# username                     = "kevin"
+#
+# [profiles.snow.oauth]
+# grant                         = "device_code"
+# client_id                     = "lakesh-cli"
+# device_authorization_endpoint = "https://idp.example.com/oauth2/v1/device/authorize"
+# token_endpoint                = "https://idp.example.com/oauth2/v1/token"
+# scope                         = "session:role:ANALYST offline_access"

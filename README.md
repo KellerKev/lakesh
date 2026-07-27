@@ -4,21 +4,26 @@
   <img src="assets/lakesh-logo.svg" alt="lakesh — duck captain steering a tugboat across the duckicelake" width="640"/>
 </p>
 
-`lakesh` is a DuckDB-powered SQL shell for **Iceberg REST catalogs and
-DuckLake metastores**. Profile-based connection management, an
-interactive REPL with SQL autocomplete + history + `psql`-style
-meta-commands, a one-shot `exec` mode for scripts, and an MCP server so
-LLM agents can query your catalogs through the same plumbing.
+`lakesh` is a DuckDB-powered SQL shell for **Iceberg REST catalogs,
+DuckLake metastores, and any database with an ADBC driver**.
+Profile-based connection management, an interactive REPL with SQL
+autocomplete + history + `psql`-style meta-commands, a one-shot `exec`
+mode for scripts, and an MCP server so LLM agents can query your
+catalogs through the same plumbing.
 
-It's a thin layer on top of DuckDB's `iceberg` and `ducklake` extensions
-— DuckDB does the heavy lifting (Parquet reads, predicate pushdown,
-joins); `lakesh` handles the ergonomics that the stock `duckdb` CLI
-doesn't:
+It's a thin layer on top of DuckDB's `iceberg`, `ducklake`, and
+`adbc_scanner` extensions — DuckDB does the heavy lifting (Parquet
+reads, predicate pushdown, joins); `lakesh` handles the ergonomics that
+the stock `duckdb` CLI doesn't:
 
 - Multiple catalog profiles in a TOML config, switchable via `-p <name>`.
-- Two profile types: **Iceberg REST** (PyIceberg-style endpoint) or
-  **DuckLake direct** (Postgres metadata + S3 data path).
-- OAuth2 token fetch + reuse per session (clients don't have to see JWTs).
+- Three profile types: **Iceberg REST** (PyIceberg-style endpoint),
+  **DuckLake direct** (Postgres metadata + S3 data path), or **ADBC**
+  (Postgres, MySQL, Snowflake, BigQuery, SQL Server, Trino, Flight SQL,
+  SQLite, … via [ADBC drivers](https://arrow.apache.org/adbc/)).
+- Native OAuth2 per data source: **client-credentials, device-code, and
+  authorization-code (PKCE)** grants, with token caching + refresh
+  (`lakesh auth login/status/logout`).
 - S3 / MinIO credential plumbing that avoids `duckdb-iceberg`'s known
   path-style + delegation-mode footguns.
 - psql-style `\\l` / `\\d` / `\\timing` / `\\format` meta-commands.
@@ -181,10 +186,135 @@ Iceberg REST view of `duckicelake`, but read directly via the
 `UPDATE` / `DELETE`) because the iceberg-ext doesn't support those
 operations through REST.
 
+### ADBC profile — query practically anything
+
+The `adbc_scanner` [community extension](https://duckdb.org/community_extensions/extensions/adbc_scanner)
+is loaded by default in every lakesh session, so `adbc_connect()` /
+`adbc_scan()` etc. are always available in the REPL. An `adbc` profile
+goes further and ATTACHes the source as a catalog, so autocomplete,
+`\l` / `\d`, `doctor`, and the MCP tools all work against it:
+
+```toml
+[profiles.pg]
+type      = "adbc"
+driver    = "postgresql"    # manifest name or full path to the driver lib
+uri       = "postgresql://reporting:hunter2@db.example.com:5432/appdb"
+catalog   = "pg"            # tables appear as pg.<schema>.<table>
+read_only = true            # optional
+```
+
+A complete, copy-paste-ready example (fake credentials, setup steps in
+the comments) lives at
+[`examples/config.postgres-adbc.toml`](examples/config.postgres-adbc.toml):
+
+```bash
+dbc install postgresql
+cp examples/config.postgres-adbc.toml ~/.config/lakesh/config.toml
+# edit host/db/password, then:
+lakesh doctor
+lakesh exec -q 'SELECT * FROM pg.public.users LIMIT 5'
+```
+
+Drivers that accept option-based auth (e.g. flightsql) can use an
+`[profiles.X.options]` table instead of URI credentials — any key
+supports `*_env` indirection:
+
+```toml
+[profiles.flight.options]
+username     = "svc"
+password_env = "LAKESH_FLIGHT_PASSWORD"
+```
+
+ADBC drivers are shared libraries installed out-of-band — easiest via
+the [`dbc` CLI](https://dbc.columnar.tech): `dbc install postgresql`.
+Tested drivers include postgresql, mysql, snowflake, bigquery,
+sqlserver, trino, flightsql, and sqlite. `lakesh doctor -p pg` checks
+the extension, the driver, and the connection, and hints at
+`dbc install <driver>` when the driver can't be resolved.
+
+Credential-shaped options (`username`, `password`, `database`,
+`entrypoint`) are stored in a DuckDB `SECRET` scoped to the source URI —
+they never appear in SQL text. Other driver options (dotted keys like
+`adbc.snowflake.sql.account`) ride on the ATTACH. Reads support
+projection/filter pushdown; `UPDATE`/`DELETE` through the attached
+catalog aren't supported by the extension yet.
+
+Driver quirks worth knowing (verified against a live Postgres):
+
+- **Some drivers only accept credentials embedded in the URI** — the
+  postgresql driver rejects `username`/`password` options. Put the full
+  DSN in the config directly, or source it from an env var with
+  `uri_env` if you'd rather keep the password out of the file:
+
+  ```toml
+  [profiles.pg]
+  type   = "adbc"
+  driver = "postgresql"
+  uri    = "postgresql://reporting:s3cret@db.example.com:5432/appdb"
+  # or:  uri_env = "LAKESH_PG_DSN"   (literal `uri` wins if both are set)
+  ```
+
+- Upstream `adbc_scanner` bug: `GROUP BY` / `DISTINCT` on **short
+  (≤12-byte) VARCHAR columns** read through an attached catalog can
+  return corrupted group keys. Longer strings, joins, filters, plain
+  scans, and the raw `adbc_scan()` function are unaffected. Workaround
+  until fixed upstream: force a copy, e.g. `GROUP BY kind || ''`.
+
+### OAuth2 per data source
+
+Every profile type (except ducklake, which authenticates via its
+Postgres DSN) can carry an `[profiles.X.oauth]` block. Three grants:
+
+| Grant | Use case | Required fields |
+|---|---|---|
+| `client_credentials` (default) | machine-to-machine | `client_id`, `client_secret` (+ `token_endpoint` unless iceberg-rest) |
+| `device_code` | CLI login, no local browser needed | `client_id`, `device_authorization_endpoint`, `token_endpoint` |
+| `authorization_code` | browser SSO login with PKCE | `client_id`, `authorization_endpoint`, `token_endpoint` |
+
+Common optional fields: `scope`, `audience`, `client_secret`,
+`redirect_port` (for IdPs that require an exact pre-registered loopback
+redirect URI), and an `[oauth.extra]` table of passthrough form params.
+For iceberg-rest profiles the token endpoint defaults to the catalog's
+own `/v1/oauth/tokens` — existing configs keep working unchanged.
+
+```toml
+[profiles.snow.oauth]
+grant                         = "device_code"
+client_id                     = "lakesh-cli"
+device_authorization_endpoint = "https://idp.example.com/oauth2/v1/device/authorize"
+token_endpoint                = "https://idp.example.com/oauth2/v1/token"
+scope                         = "session:role:ANALYST offline_access"
+```
+
+Tokens (access + refresh + expiry) are cached in
+`$XDG_STATE_HOME/lakesh/tokens.json` (file mode 0600, same trust level
+as config-file secrets) and refreshed automatically. Interactive grants
+only prompt when nothing cached is usable:
+
+```bash
+lakesh auth login -p snow      # run the flow, cache the token
+lakesh auth status             # per-profile cache state
+lakesh auth logout -p snow     # drop one profile's token (--all for everything)
+```
+
+Where the token lands: for iceberg-rest it goes into the `ICEBERG`
+secret as before. For adbc profiles, set `token_option` to the ADBC
+driver option that takes the bearer token (e.g. Snowflake's
+`adbc.snowflake.sql.client_option.auth_token`), or embed a `{token}`
+placeholder inside any option value (e.g.
+`authorization_header = "Bearer {token}"` for Flight SQL).
+
+Non-interactive contexts never hang on a login prompt: piped
+`lakesh exec` and the MCP server fail fast with a message telling you to
+run `lakesh auth login -p <name>` in a terminal. After that one-time
+login, cached + refreshed tokens keep the MCP server working
+indefinitely (until the refresh token dies).
+
 ### Secrets from env vars
 
 Any `client_id` / `client_secret` / `access_key` / `secret_key` /
-`postgres_dsn` can be sourced via a `*_env` sibling:
+`postgres_dsn` — and any key inside an adbc `[profiles.X.options]`
+table — can be sourced via a `*_env` sibling:
 
 ```toml
 [profiles.prod.oauth]
@@ -208,8 +338,11 @@ Literal values win over env lookups when both are set.
 | `lakesh exec -q '<sql>'` | Run one query and exit (table output) |
 | `lakesh exec -f json -q '<sql>'` | JSON output — machine-readable |
 | `lakesh exec -f csv -q '<sql>'` | CSV output |
-| `lakesh doctor [-p <name>]` | REST (iceberg-rest only) + ATTACH + list-namespaces smoke test |
+| `lakesh doctor [-p <name>]` | REST probe + auth + extension/driver checks + ATTACH smoke test |
 | `lakesh mcp` | Run as an MCP server on stdio for LLM clients |
+| `lakesh auth login -p <name> [--force]` | Run the profile's OAuth2 flow, cache the token |
+| `lakesh auth status` | Show cached-token state per OAuth-enabled profile |
+| `lakesh auth logout [-p <name> \| --all]` | Drop cached tokens |
 | `lakesh profiles list` | Enumerate configured profiles |
 | `lakesh profiles show <name>` | Dump one profile (secrets redacted) |
 | `lakesh config path` | Print where lakesh will read config from |
@@ -307,14 +440,17 @@ lakesh/
 ├── example.config.toml
 ├── src/lakesh/
 │   ├── config.py        # TOML loader + Profile dataclass + env indirection
-│   ├── duck.py          # DuckDB connect: dispatches iceberg-rest vs ducklake
+│   ├── duck.py          # DuckDB connect: iceberg-rest / ducklake / adbc
+│   ├── oauth.py         # OAuth2 grants (cc / device / auth-code+PKCE) + token cache
 │   ├── output.py        # rich table / json / csv formatters
 │   ├── repl.py          # prompt_toolkit REPL + meta-commands
 │   ├── mcp.py           # FastMCP server: query / list_* / describe_table tools
-│   └── cli.py           # typer-based entry points
+│   └── cli.py           # typer-based entry points (incl. `lakesh auth …`)
 └── tests/
-    ├── test_config.py        # config parsing (iceberg-rest + ducklake)
-    ├── test_mcp.py           # MCP tools + read-only safety gate
+    ├── test_config.py        # config parsing (iceberg-rest + ducklake + adbc + oauth)
+    ├── test_oauth.py         # all three grants + refresh + token cache (mocked HTTP)
+    ├── test_adbc.py          # adbc SQL builders + live sqlite e2e (auto-skips)
+    ├── test_mcp.py           # MCP tools + read-only safety gate + AuthRequired
     └── test_integration.py   # live query against a running catalog (auto-skips)
 ```
 

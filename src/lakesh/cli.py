@@ -5,6 +5,9 @@ Config management under `lakesh config …`, profile inspection under
 """
 from __future__ import annotations
 
+import re
+import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -20,21 +23,32 @@ from .config import (
     write_example_config,
 )
 from .duck import catalog_alias, connect
+from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
 
 
 app = typer.Typer(
-    help="DuckDB-powered SQL shell for Iceberg REST catalogs.",
+    help="DuckDB-powered SQL shell for Iceberg REST catalogs, DuckLake, "
+         "and ADBC data sources.",
     no_args_is_help=False,
     add_completion=False,
 )
 config_app = typer.Typer(help="Manage the TOML config file.")
 profiles_app = typer.Typer(help="List + inspect configured profiles.")
+auth_app = typer.Typer(help="OAuth2 login + token cache management.")
 app.add_typer(config_app, name="config")
 app.add_typer(profiles_app, name="profiles")
+app.add_typer(auth_app, name="auth")
 
 console = Console()
 err_console = Console(stderr=True)
+
+
+_SECRET_OPTION_RE = re.compile(r"password|secret|token|key", re.IGNORECASE)
+
+
+def _redact_option(key: str, value: str) -> str:
+    return "***" if _SECRET_OPTION_RE.search(key) else value
 
 
 def _load_or_die(config_path: Optional[Path]) -> Config:
@@ -97,7 +111,10 @@ def run(
     if warehouse:
         prof.warehouse = warehouse
     try:
-        con = connect(prof)
+        con = connect(prof, interactive=sys.stderr.isatty())
+    except AuthRequired as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
     except Exception as e:
         err_console.print(f"[red]connect failed:[/red] {e}")
         raise typer.Exit(code=1)
@@ -132,7 +149,6 @@ def exec(
         echo 'SELECT 1' | lakesh exec -f json
     """
     if query is None:
-        import sys
         query = sys.stdin.read()
     query = query.strip().rstrip(";").strip()
     if not query:
@@ -154,7 +170,10 @@ def exec(
         prof.warehouse = warehouse
 
     try:
-        con = connect(prof)
+        con = connect(prof, interactive=sys.stderr.isatty())
+    except AuthRequired as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
     except Exception as e:
         err_console.print(f"[red]connect failed:[/red] {e}")
         raise typer.Exit(code=1)
@@ -238,9 +257,42 @@ def doctor(
             console.print(f"[red]✗ REST /v1/config: {e}[/red]")
             ok = False
 
-    # 2. ATTACH + namespace listing
+    # 2. OAuth token acquisition (any oauth-enabled profile)
+    if prof.oauth.enabled and prof.type != "ducklake":
+        from .oauth import get_token
+        try:
+            tok = get_token(prof, interactive=sys.stderr.isatty())
+            console.print(
+                f"[green]✓[/green] auth: {prof.oauth.grant} token acquired"
+                if tok else "[yellow]– auth: no token endpoint resolvable[/yellow]"
+            )
+        except AuthRequired as e:
+            console.print(f"[red]✗ auth: {e}[/red]")
+            ok = False
+        except Exception as e:
+            console.print(f"[red]✗ auth ({prof.oauth.grant}): {e}[/red]")
+            ok = False
+
+    # 3. adbc_scanner extension + driver (adbc profiles)
+    if prof.type == "adbc":
+        import duckdb as _duckdb
+        from .duck import load_adbc_scanner
+        try:
+            probe = _duckdb.connect(":memory:")
+            load_adbc_scanner(probe, required=True)
+            probe.close()
+            console.print("[green]✓[/green] adbc_scanner extension installed + loaded")
+        except Exception as e:
+            console.print(
+                f"[red]✗ adbc_scanner extension: {e}[/red]\n"
+                f"  (community extension — needs network on first install, "
+                f"DuckDB 1.4+/1.5, and a supported platform)"
+            )
+            ok = False
+
+    # 4. ATTACH + namespace listing
     try:
-        con = connect(prof)
+        con = connect(prof, interactive=sys.stderr.isatty())
         catalog = catalog_alias(prof)
         rows = con.execute(
             "SELECT schema_name FROM information_schema.schemata "
@@ -256,10 +308,119 @@ def doctor(
         con.close()
     except Exception as e:
         console.print(f"[red]✗ attach + list: {e}[/red]")
+        msg = str(e).lower()
+        if prof.type == "adbc" and ("driver" in msg or "manifest" in msg):
+            console.print(
+                f"  [yellow]hint:[/yellow] the ADBC driver {prof.driver!r} may "
+                f"not be installed — try: dbc install {prof.driver}"
+            )
         ok = False
 
     if not ok:
         raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------
+# auth sub-commands
+
+@auth_app.command("login")
+def auth_login(
+    profile: Optional[str] = typer.Option(None, "-p", "--profile"),
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+    force: bool = typer.Option(
+        False, "--force", help="Discard any cached token and re-run the flow."
+    ),
+):
+    """Run the profile's OAuth2 flow and cache the resulting token."""
+    from .oauth import TokenCache, get_token
+
+    cfg = _load_or_die(config_path)
+    try:
+        prof = cfg.get(profile)
+    except ConfigError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    if not prof.oauth.enabled or prof.type == "ducklake":
+        err_console.print(
+            f"[yellow]profile {prof.name!r} has no OAuth configured[/yellow]"
+        )
+        raise typer.Exit(code=2)
+    try:
+        tok = get_token(prof, interactive=True, force=force)
+    except Exception as e:
+        err_console.print(f"[red]login failed:[/red] {e}")
+        raise typer.Exit(code=1)
+    if not tok:
+        err_console.print("[red]no token acquired[/red]")
+        raise typer.Exit(code=1)
+    cache = TokenCache()
+    entry = cache.status().get(prof.name) or {}
+    token_meta = entry.get("token") or {}
+    expires_at = token_meta.get("expires_at")
+    exp = (
+        f"expires in {int((expires_at - time.time()) / 60)}m"
+        if expires_at else "no expiry reported"
+    )
+    refresh = "yes" if token_meta.get("refresh_token") else "no"
+    console.print(
+        f"[green]✓[/green] logged in to [bold]{prof.name}[/bold] "
+        f"({prof.oauth.grant}; {exp}; refresh token: {refresh})"
+    )
+
+
+@auth_app.command("status")
+def auth_status(
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+):
+    """Show cached-token state for every OAuth-enabled profile."""
+    from .oauth import TokenCache
+
+    cfg = _load_or_die(config_path)
+    cache = TokenCache()
+    entries = cache.status()
+    console.print(f"[dim]# token cache: {cache.path}[/dim]")
+    any_oauth = False
+    for name in sorted(cfg.profiles):
+        p = cfg.profiles[name]
+        if not p.oauth.enabled or p.type == "ducklake":
+            continue
+        any_oauth = True
+        entry = entries.get(name)
+        if not entry:
+            state = "[yellow]not logged in[/yellow]"
+        else:
+            token_meta = entry.get("token") or {}
+            expires_at = token_meta.get("expires_at")
+            if expires_at is None:
+                state = "[green]cached[/green] (no expiry reported)"
+            elif expires_at > time.time():
+                state = f"[green]cached[/green] (expires in {int((expires_at - time.time()) / 60)}m)"
+            else:
+                state = "[yellow]expired[/yellow]"
+            if token_meta.get("refresh_token"):
+                state += " +refresh"
+        console.print(f"  {name}  [dim]{p.oauth.grant}[/dim]  {state}")
+    if not any_oauth:
+        console.print("  [dim]no OAuth-enabled profiles configured[/dim]")
+
+
+@auth_app.command("logout")
+def auth_logout(
+    profile: Optional[str] = typer.Option(None, "-p", "--profile"),
+    all_profiles: bool = typer.Option(False, "--all", help="Clear every cached token."),
+):
+    """Drop cached tokens (one profile with -p, or --all)."""
+    from .oauth import TokenCache
+
+    if not profile and not all_profiles:
+        err_console.print("[red]pass -p <profile> or --all[/red]")
+        raise typer.Exit(code=2)
+    cache = TokenCache()
+    cache.clear(None if all_profiles else profile)
+    console.print(
+        "[green]✓[/green] cleared all cached tokens"
+        if all_profiles else f"[green]✓[/green] cleared cached token for {profile!r}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -299,14 +460,25 @@ def config_show(
     console.print(f"default = [cyan]{cfg.default!r}[/cyan]")
     for name, p in cfg.profiles.items():
         console.print(f"\n[bold]{name}[/bold]  ({p.type})")
-        console.print(f"  uri        = {p.uri}")
-        console.print(f"  warehouse  = {p.warehouse}")
-        console.print(f"  s3         = {p.s3.region}@{p.s3.endpoint or 'default'} "
-                      f"(path_style={p.s3.path_style})")
-        ak = "***" if p.s3.access_key else "unset"
-        console.print(f"  s3.keys    = {ak}")
+        if p.type == "adbc":
+            console.print(f"  driver     = {p.driver}")
+            console.print(f"  uri        = {p.uri or '(options-configured)'}")
+            console.print(f"  catalog    = {p.catalog}  (read_only={p.read_only})")
+            for k, v in p.options.items():
+                console.print(f"  options.{k} = {_redact_option(k, v)}")
+        else:
+            console.print(f"  uri        = {p.uri}")
+            console.print(f"  warehouse  = {p.warehouse}")
+            console.print(f"  s3         = {p.s3.region}@{p.s3.endpoint or 'default'} "
+                          f"(path_style={p.s3.path_style})")
+            ak = "***" if p.s3.access_key else "unset"
+            console.print(f"  s3.keys    = {ak}")
         if p.oauth.enabled:
-            console.print(f"  oauth      = client_id={p.oauth.client_id!r}, secret=***")
+            console.print(
+                f"  oauth      = {p.oauth.grant} (client_id={p.oauth.client_id!r}"
+                + (f", endpoint={p.oauth.token_endpoint}" if p.oauth.token_endpoint else "")
+                + ")"
+            )
         else:
             console.print(f"  oauth      = disabled")
 
@@ -339,13 +511,23 @@ def profiles_show(
         raise typer.Exit(code=2)
     console.print(f"[bold]{p.name}[/bold]")
     console.print(f"  type       = {p.type}")
-    console.print(f"  uri        = {p.uri}")
-    console.print(f"  warehouse  = {p.warehouse}")
-    console.print(f"  s3.endpoint= {p.s3.endpoint}")
-    console.print(f"  s3.region  = {p.s3.region}")
-    console.print(f"  s3.keys    = {'***' if p.s3.access_key else 'unset'}")
-    console.print(f"  s3.path_style = {p.s3.path_style}")
-    console.print(f"  oauth      = {'enabled' if p.oauth.enabled else 'disabled'}")
+    if p.type == "adbc":
+        console.print(f"  driver     = {p.driver}")
+        console.print(f"  uri        = {p.uri or '(options-configured)'}")
+        console.print(f"  catalog    = {p.catalog}")
+        console.print(f"  read_only  = {p.read_only}")
+        for k, v in p.options.items():
+            console.print(f"  options.{k} = {_redact_option(k, v)}")
+    else:
+        console.print(f"  uri        = {p.uri}")
+        console.print(f"  warehouse  = {p.warehouse}")
+        console.print(f"  s3.endpoint= {p.s3.endpoint}")
+        console.print(f"  s3.region  = {p.s3.region}")
+        console.print(f"  s3.keys    = {'***' if p.s3.access_key else 'unset'}")
+        console.print(f"  s3.path_style = {p.s3.path_style}")
+    console.print(
+        f"  oauth      = {p.oauth.grant if p.oauth.enabled else 'disabled'}"
+    )
 
 
 if __name__ == "__main__":

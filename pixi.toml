@@ -38,6 +38,9 @@ mcp = "lakesh mcp"
 [feature.dev.pypi-dependencies]
 pytest = ">=8,<9"
 pytest-asyncio = ">=0.23"
+# Ships the sqlite ADBC driver shared library — lets the adbc
+# end-to-end test run without a system-wide `dbc install sqlite`.
+adbc-driver-sqlite = ">=1.0"
 
 [feature.dev.tasks]
 test = "pytest"
