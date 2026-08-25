@@ -5,7 +5,6 @@ Config management under `lakesh config …`, profile inspection under
 """
 from __future__ import annotations
 
-import re
 import sys
 import time
 from pathlib import Path
@@ -25,6 +24,7 @@ from .config import (
 from .duck import catalog_alias, connect
 from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
+from .redact import profile_secrets, redact_option, redact_uri, scrub
 
 
 app = typer.Typer(
@@ -42,13 +42,6 @@ app.add_typer(auth_app, name="auth")
 
 console = Console()
 err_console = Console(stderr=True)
-
-
-_SECRET_OPTION_RE = re.compile(r"password|secret|token|key", re.IGNORECASE)
-
-
-def _redact_option(key: str, value: str) -> str:
-    return "***" if _SECRET_OPTION_RE.search(key) else value
 
 
 def _load_or_die(config_path: Optional[Path]) -> Config:
@@ -169,20 +162,24 @@ def exec(
     if warehouse:
         prof.warehouse = warehouse
 
+    # A driver error will happily quote the failing statement with the
+    # DSN inline, so everything printed from here on gets scrubbed.
+    secrets = profile_secrets(prof)
+
     try:
         con = connect(prof, interactive=sys.stderr.isatty())
     except AuthRequired as e:
-        err_console.print(f"[red]{e}[/red]")
+        err_console.print(f"[red]{scrub(str(e), secrets)}[/red]")
         raise typer.Exit(code=1)
     except Exception as e:
-        err_console.print(f"[red]connect failed:[/red] {e}")
+        err_console.print(f"[red]connect failed:[/red] {scrub(str(e), secrets)}")
         raise typer.Exit(code=1)
     try:
         cur = con.execute(query)
         columns = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall()
     except Exception as e:
-        err_console.print(f"[red]{e}[/red]")
+        err_console.print(f"[red]{scrub(str(e), secrets)}[/red]")
         raise typer.Exit(code=1)
     finally:
         con.close()
@@ -246,6 +243,7 @@ def doctor(
         raise typer.Exit(code=2)
 
     ok = True
+    secrets = profile_secrets(prof)
 
     # 1. REST `/v1/config` (iceberg-rest only; ducklake talks straight to PG)
     if prof.type == "iceberg-rest":
@@ -307,8 +305,9 @@ def doctor(
         )
         con.close()
     except Exception as e:
-        console.print(f"[red]✗ attach + list: {e}[/red]")
-        msg = str(e).lower()
+        text = scrub(str(e), secrets)
+        console.print(f"[red]✗ attach + list: {text}[/red]")
+        msg = text.lower()
         if prof.type == "adbc" and ("driver" in msg or "manifest" in msg):
             console.print(
                 f"  [yellow]hint:[/yellow] the ADBC driver {prof.driver!r} may "
@@ -462,12 +461,12 @@ def config_show(
         console.print(f"\n[bold]{name}[/bold]  ({p.type})")
         if p.type == "adbc":
             console.print(f"  driver     = {p.driver}")
-            console.print(f"  uri        = {p.uri or '(options-configured)'}")
+            console.print(f"  uri        = {redact_uri(p.uri) or '(options-configured)'}")
             console.print(f"  catalog    = {p.catalog}  (read_only={p.read_only})")
             for k, v in p.options.items():
-                console.print(f"  options.{k} = {_redact_option(k, v)}")
+                console.print(f"  options.{k} = {redact_option(k, v)}")
         else:
-            console.print(f"  uri        = {p.uri}")
+            console.print(f"  uri        = {redact_uri(p.uri)}")
             console.print(f"  warehouse  = {p.warehouse}")
             console.print(f"  s3         = {p.s3.region}@{p.s3.endpoint or 'default'} "
                           f"(path_style={p.s3.path_style})")
@@ -513,13 +512,13 @@ def profiles_show(
     console.print(f"  type       = {p.type}")
     if p.type == "adbc":
         console.print(f"  driver     = {p.driver}")
-        console.print(f"  uri        = {p.uri or '(options-configured)'}")
+        console.print(f"  uri        = {redact_uri(p.uri) or '(options-configured)'}")
         console.print(f"  catalog    = {p.catalog}")
         console.print(f"  read_only  = {p.read_only}")
         for k, v in p.options.items():
-            console.print(f"  options.{k} = {_redact_option(k, v)}")
+            console.print(f"  options.{k} = {redact_option(k, v)}")
     else:
-        console.print(f"  uri        = {p.uri}")
+        console.print(f"  uri        = {redact_uri(p.uri)}")
         console.print(f"  warehouse  = {p.warehouse}")
         console.print(f"  s3.endpoint= {p.s3.endpoint}")
         console.print(f"  s3.region  = {p.s3.region}")

@@ -22,6 +22,12 @@ anything that doesn't start with `SELECT` / `SHOW` / `DESCRIBE` / `WITH`
 (case-insensitive). Set `LAKESH_MCP_WRITE=1` in the server's environment
 to enable INSERT / UPDATE / DELETE / DDL / DuckLake procedure calls.
 
+### Safety: nothing credential-shaped goes to the model
+
+`list_profiles` output and every error payload land in an LLM's context.
+For Snowflake and Postgres profiles the connection URI *is* the
+credential, so both routes go through `redact` first. See that module.
+
 ### Performance: per-call connections
 
 Each tool call opens + closes a fresh DuckDB connection. That's slower
@@ -45,6 +51,7 @@ from .config import Config, ConfigError, default_config_path, load_config
 from .duck import catalog_alias, connect
 from .oauth import AuthRequired
 from .output import _stringify  # type: ignore[attr-defined]
+from .redact import profile_secrets, redact_uri, scrub
 
 
 _READ_ONLY_LEADING = re.compile(r"^\s*(select|show|describe|desc|with|explain|pragma|values)\b", re.IGNORECASE)
@@ -62,11 +69,27 @@ def _writes_enabled() -> bool:
     return os.environ.get("LAKESH_MCP_WRITE", "0") in ("1", "true", "yes")
 
 
+# Every credential seen in a loaded config, so `_error` can scrub free
+# text. Populated by `_load_or_raise`; a module-level set because errors
+# surface from call sites that no longer have the profile in hand.
+_KNOWN_SECRETS: set[str] = set()
+
+
 def _load_or_raise(config_path: Path | None = None) -> Config:
     try:
-        return load_config(config_path)
+        cfg = load_config(config_path)
     except ConfigError as e:
         raise RuntimeError(str(e)) from e
+    for prof in cfg.profiles.values():
+        _KNOWN_SECRETS.update(profile_secrets(prof))
+    return cfg
+
+
+def _error(exc: Exception | str) -> str:
+    """The single error path for every tool. Driver errors quote the
+    failing statement, DSN inline, so nothing reaches the model without
+    passing through `scrub` first."""
+    return json.dumps({"error": scrub(str(exc), _KNOWN_SECRETS)})
 
 
 @contextmanager
@@ -142,10 +165,12 @@ def list_profiles() -> str:
     for name in sorted(cfg.profiles):
         p = cfg.profiles[name]
         if p.type == "iceberg-rest":
-            desc = f"Iceberg REST {p.uri} (warehouse={p.warehouse})"
+            desc = f"Iceberg REST {redact_uri(p.uri)} (warehouse={p.warehouse})"
         elif p.type == "adbc":
+            # redact_uri, not p.uri: for a gosnowflake or libpq DSN the
+            # URI is the credential, and this string goes to the model.
             desc = (
-                f"ADBC {p.driver} {p.uri or '(options-configured)'} "
+                f"ADBC {p.driver} {redact_uri(p.uri) or '(options-configured)'} "
                 f"(catalog={p.catalog})"
             )
         else:
@@ -173,7 +198,7 @@ def list_namespaces(profile: str | None = None) -> str:
                 [catalog],
             ).fetchall()
     except AuthRequired as e:
-        return json.dumps({"error": str(e)})
+        return _error(e)
     return json.dumps([r[0] for r in rows])
 
 
@@ -193,7 +218,7 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
             q += " ORDER BY 1, 2"
             rows = con.execute(q, params).fetchall()
     except AuthRequired as e:
-        return json.dumps({"error": str(e)})
+        return _error(e)
     return json.dumps([{"namespace": r[0], "table": r[1]} for r in rows])
 
 
@@ -211,7 +236,7 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
                 [catalog, namespace, table],
             ).fetchall()
     except AuthRequired as e:
-        return json.dumps({"error": str(e)})
+        return _error(e)
     return json.dumps([
         {"column": r[0], "type": r[1], "nullable": r[2] == "YES", "position": int(r[3])}
         for r in rows
@@ -266,9 +291,9 @@ def query(
                 columns = [d[0] for d in cur.description] if cur.description else []
                 rows = cur.fetchmany(limit)
             except duckdb.Error as e:
-                return json.dumps({"error": str(e)})
+                return _error(e)
     except AuthRequired as e:
-        return json.dumps({"error": str(e)})
+        return _error(e)
 
     if not columns:
         return json.dumps({"ok": True, "rows": 0, "note": "no result set"})
