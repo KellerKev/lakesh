@@ -141,6 +141,43 @@ def _not_system_schemas(column: str) -> str:
     return f"{column} NOT IN ({', '.join(_lit(s) for s in _SYSTEM_SCHEMAS)})"
 
 
+# --------------------------------------------------------------------------
+# pattern matching for search_objects
+
+# `!` rather than the conventional backslash. Snowflake treats a backslash
+# as an escape character *inside string literals*, while Postgres (with
+# standard_conforming_strings on) and DuckDB treat it as a literal — so
+# `ESCAPE '\'` would need to be written two different ways depending on
+# the source. `!` has no literal-level meaning in any of the three.
+_LIKE_ESCAPE = "!"
+
+
+def _like_pattern(pattern: str) -> str:
+    """Translate a caller's pattern into a LIKE pattern.
+
+    `_` is escaped to a literal underscore: analytic table names are full
+    of them and nobody types `fact_revenue` meaning `fact<any char>revenue`.
+    `%` is honoured as the wildcard, and its presence suppresses the
+    implicit `%…%` wrap so `revenue%` means prefix-match. A bare word is
+    wrapped, because the whole point of the tool is that the caller
+    doesn't know the naming convention yet.
+    """
+    escaped = (
+        pattern.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+    return escaped if "%" in escaped else f"%{escaped}%"
+
+
+def _ilike(column: str, like: str) -> str:
+    """Case-insensitive match for the native path. ILIKE is available on
+    Snowflake, Postgres and DuckDB alike, and case-insensitivity is not
+    optional here: Snowflake upper-cases unquoted identifiers and
+    Postgres lower-cases them, so the same logical name is spelled two
+    ways depending on which source you ask."""
+    return f"{column} ILIKE {_lit(like)} ESCAPE {_lit(_LIKE_ESCAPE)}"
+
+
 @contextmanager
 def _open_native(profile_name: str | None) -> Iterator[tuple[duckdb.DuckDBPyConnection, int, Profile]]:
     cfg = _load_or_raise()
@@ -231,7 +268,9 @@ server = FastMCP(
     instructions=(
         "SQL access to Iceberg REST catalogs, DuckLake metastores, and any "
         "ADBC source (Snowflake, Postgres, …). Use `list_profiles` to "
-        "discover what's configured, `list_namespaces` / `list_tables` / "
+        "discover what's configured, `search_objects` to find a schema, "
+        "table or column by name when you don't already know where it "
+        "lives, `list_namespaces` / `list_tables` / "
         "`describe_table` to navigate, and `query` to run SELECT "
         "statements. For ADBC profiles `query` sends the source's own SQL "
         "dialect straight through, and table names are the source's own "
@@ -377,6 +416,316 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
          "position": int(r[3])}
         for r in rows
     ])
+
+
+# --------------------------------------------------------------------------
+# search_objects
+#
+# The three legs are UNIONed into ONE statement rather than issued as
+# three queries. Against a remote source the cost of a metadata call is
+# round-trip latency, so three calls is three times the wall clock on the
+# very source where wall clock is the problem.
+#
+# Every NULL placeholder is CAST: a bare untyped NULL in a UNION branch is
+# a type-resolution hazard on Postgres.
+
+_SEARCH_LEGS = ("schema", "table", "column")
+
+# Per matching object, not per matching column: a table with 300 columns
+# matching `%id%` would otherwise bury every other result.
+_MAX_COLUMNS_PER_OBJECT = 10
+
+
+def _search_legs(match: str) -> tuple[str, ...]:
+    return _SEARCH_LEGS if match == "all" else (match,)
+
+
+def _search_sql_native(like: str, namespace: str | None, match: str) -> str:
+    """One statement for the source's own information_schema."""
+    ns_table = f" AND t.table_schema = {_lit(namespace)}" if namespace else ""
+    ns_col = f" AND c.table_schema = {_lit(namespace)}" if namespace else ""
+    parts = {
+        "schema": (
+            "SELECT 'schema' AS matched_on, s.schema_name AS object_schema, "
+            "CAST(NULL AS VARCHAR) AS object_table, "
+            "CAST(NULL AS VARCHAR) AS object_column, "
+            "CAST(NULL AS VARCHAR) AS data_type "
+            "FROM information_schema.schemata s "
+            f"WHERE {_not_system_schemas('s.schema_name')} "
+            f"  AND {_ilike('s.schema_name', like)}"
+        ),
+        # Every leg carries the full alias list, not just the first. A
+        # UNION takes its column names from whichever branch leads, and
+        # `match`/`namespace` can drop the schema leg — leaving two
+        # unaliased CAST(NULL AS VARCHAR) columns that both come back
+        # named "varchar", which the adbc_scan binder rejects as
+        # duplicates.
+        "table": (
+            "SELECT 'table' AS matched_on, t.table_schema AS object_schema, "
+            "t.table_name AS object_table, "
+            "CAST(NULL AS VARCHAR) AS object_column, "
+            "CAST(NULL AS VARCHAR) AS data_type "
+            "FROM information_schema.tables t "
+            f"WHERE {_not_system_schemas('t.table_schema')}{ns_table} "
+            f"  AND {_ilike('t.table_name', like)}"
+        ),
+        "column": (
+            "SELECT 'column' AS matched_on, c.table_schema AS object_schema, "
+            "c.table_name AS object_table, c.column_name AS object_column, "
+            "c.data_type AS data_type "
+            "FROM information_schema.columns c "
+            f"WHERE {_not_system_schemas('c.table_schema')}{ns_col} "
+            f"  AND {_ilike('c.column_name', like)}"
+        ),
+    }
+    # A namespace filter makes the schema leg meaningless — the caller has
+    # already told us which schema they mean.
+    legs = [
+        parts[leg] for leg in _search_legs(match)
+        if not (leg == "schema" and namespace)
+    ]
+    return " UNION ALL ".join(legs)
+
+
+def _search_sql_duckdb(
+    like: str, namespace: str | None, match: str, catalog: str
+) -> tuple[str, list]:
+    """Same shape against DuckDB's own catalog, but bound rather than
+    interpolated — DuckDB takes real parameters, so use them."""
+    legs: list[str] = []
+    params: list = []
+    for leg in _search_legs(match):
+        if leg == "schema":
+            if namespace:
+                continue
+            legs.append(
+                "SELECT 'schema' AS matched_on, schema_name AS object_schema, "
+                "CAST(NULL AS VARCHAR) AS object_table, "
+                "CAST(NULL AS VARCHAR) AS object_column, "
+                "CAST(NULL AS VARCHAR) AS data_type "
+                "FROM information_schema.schemata "
+                "WHERE catalog_name = ? "
+                f"  AND {_not_system_schemas('schema_name')} "
+                f"  AND schema_name ILIKE ? ESCAPE {_lit(_LIKE_ESCAPE)}"
+            )
+            params += [catalog, like]
+        elif leg == "table":
+            ns = " AND table_schema = ?" if namespace else ""
+            legs.append(
+                "SELECT 'table' AS matched_on, table_schema AS object_schema, "
+                "table_name AS object_table, "
+                "CAST(NULL AS VARCHAR) AS object_column, "
+                "CAST(NULL AS VARCHAR) AS data_type "
+                "FROM information_schema.tables "
+                f"WHERE table_catalog = ?{ns} "
+                f"  AND {_not_system_schemas('table_schema')} "
+                f"  AND table_name ILIKE ? ESCAPE {_lit(_LIKE_ESCAPE)}"
+            )
+            params += [catalog] + ([namespace] if namespace else []) + [like]
+        else:
+            ns = " AND table_schema = ?" if namespace else ""
+            legs.append(
+                "SELECT 'column' AS matched_on, table_schema AS object_schema, "
+                "table_name AS object_table, column_name AS object_column, "
+                "data_type AS data_type "
+                "FROM information_schema.columns "
+                f"WHERE table_catalog = ?{ns} "
+                f"  AND {_not_system_schemas('table_schema')} "
+                f"  AND column_name ILIKE ? ESCAPE {_lit(_LIKE_ESCAPE)}"
+            )
+            params += [catalog] + ([namespace] if namespace else []) + [like]
+    return " UNION ALL ".join(legs), params
+
+
+def _wrap_search(body: str, limit: int) -> str:
+    """Order and cap in the source. An unordered LIMIT slice is
+    nondeterministic, and capping here means a pathological match never
+    streams back over the wire.
+
+    `limit + 1` is a sentinel: fetching one more row than we intend to
+    return is how we tell "exactly `limit` matches" from "more than
+    `limit` matches" without guessing.
+    """
+    return f"SELECT * FROM ({body}) x ORDER BY 2, 3, 1, 4 LIMIT {int(limit) + 1}"
+
+
+def _group_matches(rows: list[tuple]) -> list[dict]:
+    """Collapse raw match rows into one entry per object.
+
+    A search for "revenue" against a warehouse can match 60 columns
+    across 8 tables; the agent wants the 8 tables.
+    """
+    grouped: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for matched_on, schema, table, column, data_type in rows:
+        key = (schema, table)
+        entry = grouped.get(key)
+        if entry is None:
+            entry = grouped[key] = {
+                "namespace": schema,
+                "table": table,
+                "_matched": set(),
+                "_columns": [],
+                "_column_hits": 0,
+            }
+            order.append(key)
+        entry["_matched"].add(matched_on)
+        if matched_on == "column" and column is not None:
+            entry["_column_hits"] += 1
+            if len(entry["_columns"]) < _MAX_COLUMNS_PER_OBJECT:
+                entry["_columns"].append({"column": column, "type": data_type})
+
+    out = []
+    for key in sorted(order, key=lambda k: (str(k[0] or ""), str(k[1] or ""))):
+        entry = grouped[key]
+        item = {
+            "namespace": entry["namespace"],
+            "table": entry["table"],
+            "matched_on": sorted(entry["_matched"]),
+        }
+        if entry["_columns"]:
+            item["columns"] = entry["_columns"]
+            if entry["_column_hits"] > len(entry["_columns"]):
+                item["columns_truncated"] = True
+                item["column_match_count"] = entry["_column_hits"]
+        out.append(item)
+    return out
+
+
+def _search_one(
+    profile_name: str | None, like: str, namespace: str | None,
+    match: str, limit: int,
+) -> tuple[list[dict], int | None, str]:
+    """(results, truncated_at, mode) for a single profile."""
+    prof = _profile_of(profile_name)
+    if _prefer_native(prof):
+        sql = _wrap_search(_search_sql_native(like, namespace, match), limit)
+        with _open_native(profile_name) as (con, handle, _prof):
+            _cols, rows = _native(con, handle, sql)
+        mode = "native"
+    else:
+        with _open(profile_name) as (con, catalog):
+            body, params = _search_sql_duckdb(like, namespace, match, catalog)
+            rows = con.execute(_wrap_search(body, limit), params).fetchall()
+        mode = "duckdb"
+
+    truncated = limit if len(rows) > limit else None
+    return _group_matches(list(rows)[:limit]), truncated, mode
+
+
+@server.tool()
+def search_objects(
+    pattern: str,
+    profile: str | None = None,
+    namespace: str | None = None,
+    match: str = "all",
+    limit: int = 200,
+    all_profiles: bool = False,
+) -> str:
+    """Find schemas, tables and columns whose name matches `pattern`.
+
+    Use this first when you don't already know where something lives —
+    it is the only way to locate an object by name. `list_namespaces` and
+    `list_tables` enumerate; this one searches.
+
+    Args:
+        pattern: what to look for. A bare word is matched anywhere in the
+                 name (`revenue` finds `FCT_REVENUE` and `revenue_usd`).
+                 `%` is a wildcard and switches off the implicit
+                 wrap, so `revenue%` is a prefix match. `_` is literal.
+                 Matching is always case-insensitive.
+        profile: which configured profile to search. Omit for the default.
+        namespace: restrict to one schema. Worth passing as soon as you
+                 know it — it is the main lever for keeping a search on a
+                 large warehouse fast.
+        match: `all` (default), or `schema` / `table` / `column` to search
+                 only that kind of object. `table` is the cheapest.
+        limit: max raw matches to consider, capped at 1000.
+        all_profiles: search every configured profile instead of one.
+                 Costs a connection per profile inside a single call, so
+                 leave it off unless you genuinely don't know which
+                 source holds the thing.
+
+    Returns JSON with one entry per matching *object* — a table matching
+    on six columns is one entry, not six — each carrying `matched_on`
+    (any of `schema`, `table`, `column`) and, for column matches, the
+    matching `columns` (at most 10, with `columns_truncated` when there
+    were more). `truncated_at` counts raw matches, not grouped entries,
+    so it can exceed `result_count`.
+    """
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return json.dumps({"error": "empty pattern"})
+    if "\\" in pattern:
+        # `_lit` doubles single quotes but not backslashes, and Snowflake
+        # reads a backslash inside a string literal as an escape — so a
+        # trailing one would swallow the closing quote there and nowhere
+        # else. Rejecting is honest; silently mangling is not.
+        return json.dumps({
+            "error": "pattern may not contain a backslash — escaping differs "
+                     "across sources. Use % and _ instead.",
+        })
+    if match not in ("all",) + _SEARCH_LEGS:
+        return json.dumps({
+            "error": f"unknown match {match!r} (expected: all, "
+                     f"{', '.join(_SEARCH_LEGS)})",
+        })
+    if match == "schema" and namespace:
+        # Contradictory rather than merely redundant, and the honest
+        # answer is to say so — silently returning nothing would read as
+        # "no such schema".
+        return json.dumps({
+            "error": "match='schema' searches schema names, so `namespace` "
+                     "(which restricts to one schema) cannot apply. Drop one.",
+        })
+    limit = max(1, min(int(limit), 1000))
+    like = _like_pattern(pattern)
+
+    try:
+        cfg = _load_or_raise()
+        targets = sorted(cfg.profiles) if all_profiles else [profile]
+    except (ConfigError, RuntimeError) as e:
+        return _error(e)
+
+    results: list[dict] = []
+    errors: list[dict] = []
+    searched: list[str] = []
+    truncated: int | None = None
+    mode = None
+    for target in targets:
+        try:
+            found, trunc, mode = _search_one(target, like, namespace, match, limit)
+        except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+            # One profile with a cold token must not fail the whole search;
+            # report it alongside whatever the others found.
+            errors.append({
+                "profile": target or "(default)",
+                "error": scrub(str(e), _KNOWN_SECRETS),
+            })
+            continue
+        searched.append(target or cfg.default or "(default)")
+        if all_profiles:
+            for item in found:
+                item["profile"] = target
+        results.extend(found)
+        truncated = trunc if truncated is None else max(truncated, trunc or 0) or None
+
+    out: dict[str, Any] = {
+        "pattern": pattern,
+        "like": like,
+        "searched": list(_search_legs(match)),
+        "results": results,
+        "result_count": len(results),
+        "truncated_at": truncated,
+    }
+    if all_profiles:
+        out["searched_profiles"] = searched
+    else:
+        out["profile"] = searched[0] if searched else (profile or "(default)")
+        out["mode"] = mode
+    if errors:
+        out["errors"] = errors
+    return json.dumps(out, default=str)
 
 
 @server.tool()

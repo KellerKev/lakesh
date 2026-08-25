@@ -376,3 +376,214 @@ def test_query_serializes_decimal_rows(adbc_config, monkeypatch):
     monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
     out = json.loads(lakesh_mcp.query("SELECT warehouse_name, credits FROM x"))
     assert out["rows"] == [{"warehouse_name": "ANALYTICS_WH", "credits": 170.54}]
+
+
+# --------------------------------------------------------------------------
+# search_objects
+#
+# The discovery tool: an agent that doesn't know where revenue lives can
+# otherwise only list_tables per schema and eyeball the output.
+
+
+_SEARCH_COLUMNS = ("matched_on", "object_schema", "object_table",
+                   "object_column", "data_type")
+
+
+@pytest.fixture
+def fake_search(monkeypatch):
+    """A native connection returning search-shaped (5-column) rows."""
+    con = _FakeNativeConnection(columns=_SEARCH_COLUMNS, rows=[
+        ("schema", "REVENUE", None, None, None),
+        ("table", "ANALYTICS", "FCT_REVENUE", None, None),
+        ("column", "ANALYTICS", "ORDERS", "REVENUE_USD", "NUMBER"),
+        ("column", "ANALYTICS", "ORDERS", "REVENUE_LOCAL", "NUMBER"),
+    ])
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    return con
+
+
+def test_search_objects_is_one_statement(adbc_config, fake_search):
+    """The load-bearing property. Three separate queries would triple the
+    latency on exactly the source where latency is the problem."""
+    lakesh_mcp.search_objects("revenue", profile="snow")
+
+    assert len(fake_search.statements) == 1
+    sql = fake_search.statements[0]
+    for view in ("information_schema.schemata", "information_schema.tables",
+                 "information_schema.columns"):
+        assert view in sql
+    assert sql.count("UNION ALL") == 2
+    assert "ILIKE '%revenue%' ESCAPE '!'" in sql
+
+
+def test_search_objects_every_leg_is_aliased(adbc_config, fake_search):
+    """A UNION takes its column names from whichever branch leads, and
+    dropping the schema leg promotes one whose NULL casts would otherwise
+    both come back named "varchar" — which the adbc_scan binder rejects
+    as duplicate columns. Regression test for exactly that."""
+    lakesh_mcp.search_objects("revenue", profile="snow", match="table")
+    sql = fake_search.statements[0]
+    assert "CAST(NULL AS VARCHAR) AS object_column" in sql
+    assert "CAST(NULL AS VARCHAR) AS data_type" in sql
+    # No bare, unaliased cast survives anywhere.
+    assert "CAST(NULL AS VARCHAR)," not in sql
+
+
+def test_search_objects_escapes_quote_and_underscore(adbc_config, fake_search):
+    lakesh_mcp.search_objects("it's", profile="snow")
+    assert "'%it''s%'" in fake_search.statements[0]
+
+    fake_search.statements.clear()
+    # `_` is literal: nobody types fact_revenue meaning fact<any char>revenue.
+    lakesh_mcp.search_objects("fact_revenue", profile="snow")
+    assert "'%fact!_revenue%'" in fake_search.statements[0]
+
+
+def test_search_objects_honours_explicit_percent(adbc_config, fake_search):
+    """An explicit wildcard suppresses the implicit %…% wrap, so
+    `revenue%` is a prefix match rather than a contains match."""
+    out = json.loads(lakesh_mcp.search_objects("revenue%", profile="snow"))
+    assert out["like"] == "revenue%"
+    assert "'revenue%'" in fake_search.statements[0]
+
+
+def test_search_objects_rejects_backslash(adbc_config, fake_search):
+    """`_lit` doubles quotes but not backslashes, and Snowflake reads a
+    backslash inside a literal as an escape — so a trailing one would
+    swallow the closing quote there and nowhere else."""
+    out = json.loads(lakesh_mcp.search_objects(r"back\slash", profile="snow"))
+    assert "backslash" in out["error"]
+    assert fake_search.statements == []
+
+
+def test_search_objects_rejects_empty_pattern(adbc_config, fake_search):
+    assert "empty" in json.loads(lakesh_mcp.search_objects("   ", profile="snow"))["error"]
+    assert fake_search.statements == []
+
+
+def test_search_objects_scopes_to_namespace(adbc_config, fake_search):
+    """The main lever for keeping a search fast on a large warehouse."""
+    lakesh_mcp.search_objects("revenue", profile="snow", namespace="ANALYTICS")
+    sql = fake_search.statements[0]
+    assert sql.count("= 'ANALYTICS'") == 2          # tables + columns legs
+    # Searching schema names inside one schema is meaningless.
+    assert "information_schema.schemata" not in sql
+
+
+def test_search_objects_match_drops_legs(adbc_config, fake_search):
+    lakesh_mcp.search_objects("revenue", profile="snow", match="column")
+    sql = fake_search.statements[0]
+    assert "information_schema.columns" in sql
+    assert "information_schema.tables" not in sql
+    assert "UNION ALL" not in sql
+
+
+def test_search_objects_rejects_contradictory_scope(adbc_config, fake_search):
+    out = json.loads(lakesh_mcp.search_objects(
+        "x", profile="snow", match="schema", namespace="ANALYTICS"))
+    assert "cannot apply" in out["error"]
+    assert fake_search.statements == []
+
+
+def test_search_objects_groups_per_object(adbc_config, fake_search):
+    """One entry per matching object, not per matching column — a
+    "revenue" search can hit 60 columns across 8 tables and the agent
+    wants the 8 tables."""
+    out = json.loads(lakesh_mcp.search_objects("revenue", profile="snow"))
+
+    assert out["result_count"] == 3
+    by_table = {r["table"]: r for r in out["results"]}
+    assert by_table[None]["matched_on"] == ["schema"]
+    assert by_table["FCT_REVENUE"]["matched_on"] == ["table"]
+    orders = by_table["ORDERS"]
+    assert orders["matched_on"] == ["column"]
+    assert [c["column"] for c in orders["columns"]] == ["REVENUE_USD", "REVENUE_LOCAL"]
+    assert out["mode"] == "native"
+
+
+def test_search_objects_matched_on_is_a_sorted_list(adbc_config, monkeypatch):
+    """An object can match by name *and* by column; a single string would
+    force duplicate entries for the commonest case."""
+    con = _FakeNativeConnection(columns=_SEARCH_COLUMNS, rows=[
+        ("table", "ANALYTICS", "FCT_REVENUE", None, None),
+        ("column", "ANALYTICS", "FCT_REVENUE", "REVENUE_USD", "NUMBER"),
+    ])
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    out = json.loads(lakesh_mcp.search_objects("revenue", profile="snow"))
+    assert out["result_count"] == 1
+    assert out["results"][0]["matched_on"] == ["column", "table"]
+
+
+def test_search_objects_caps_columns_per_object(adbc_config, monkeypatch):
+    con = _FakeNativeConnection(columns=_SEARCH_COLUMNS, rows=[
+        ("column", "S", "WIDE", f"ID_{i}", "NUMBER") for i in range(25)
+    ])
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    out = json.loads(lakesh_mcp.search_objects("id", profile="snow"))
+    result = out["results"][0]
+    assert len(result["columns"]) == lakesh_mcp._MAX_COLUMNS_PER_OBJECT
+    assert result["columns_truncated"] is True
+    assert result["column_match_count"] == 25
+
+
+def test_search_objects_truncates_with_a_sentinel_row(adbc_config, monkeypatch):
+    """`limit + 1` is fetched so "exactly limit matches" is
+    distinguishable from "more than limit" without guessing. Note
+    truncated_at counts raw matches, not grouped results."""
+    con = _FakeNativeConnection(columns=_SEARCH_COLUMNS, rows=[
+        ("table", "S", f"T{i}", None, None) for i in range(5)
+    ])
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+
+    out = json.loads(lakesh_mcp.search_objects("t", profile="snow", limit=4))
+    assert "LIMIT 5" in con.statements[0]
+    assert out["truncated_at"] == 4
+    assert out["result_count"] == 4
+
+    con.statements.clear()
+    out = json.loads(lakesh_mcp.search_objects("t", profile="snow", limit=10))
+    assert out["truncated_at"] is None
+
+
+def test_search_objects_all_profiles_isolates_failures(adbc_config, monkeypatch):
+    """One profile with a cold token must not fail the whole search."""
+    rows = [("table", "PUBLIC", "ORDERS", None, None)]
+
+    def _connect_native(prof, **kw):
+        raise RuntimeError("260001: user is empty")
+
+    class _FakeDuckConnection:
+        """`lake` is a ducklake profile, so it takes the DuckDB arm —
+        which binds parameters instead of going through adbc_scan."""
+        def execute(self, sql, params=None):
+            return _FakeCursor(_SEARCH_COLUMNS, rows)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(lakesh_mcp, "connect_native", _connect_native)
+    monkeypatch.setattr(lakesh_mcp, "connect", lambda prof, **kw: _FakeDuckConnection())
+
+    out = json.loads(lakesh_mcp.search_objects("orders", all_profiles=True))
+    assert [e["profile"] for e in out["errors"]] == ["snow"]
+    assert out["searched_profiles"] == ["lake"]
+    assert out["results"] and out["results"][0]["profile"] == "lake"
+
+
+def test_search_objects_duckdb_path_binds_parameters(tmp_path, monkeypatch):
+    """The non-adbc arm runs against a real in-memory DuckDB — the SQL is
+    built once and must actually execute, not merely look right."""
+    import duckdb as _duckdb
+
+    con = _duckdb.connect()
+    con.execute("CREATE SCHEMA revenue")
+    con.execute("CREATE TABLE revenue.fct_orders(order_id BIGINT, revenue_usd DECIMAL(18,2))")
+    catalog = con.execute("SELECT current_database()").fetchone()[0]
+
+    body, params = lakesh_mcp._search_sql_duckdb("%revenue%", None, "all", catalog)
+    rows = con.execute(lakesh_mcp._wrap_search(body, 100), params).fetchall()
+
+    grouped = lakesh_mcp._group_matches(rows)
+    by_table = {r["table"]: r for r in grouped}
+    assert by_table[None]["matched_on"] == ["schema"]           # the revenue schema
+    assert by_table["fct_orders"]["matched_on"] == ["column"]   # revenue_usd

@@ -221,3 +221,31 @@ uri    = "{SF_DSN}"
     out = lakesh_mcp._error(RuntimeError(f"connect failed for '{SF_DSN}'"))
     assert PAT not in out
     assert "connect failed" in json.loads(out)["error"]
+
+
+def test_search_objects_does_not_leak(tmp_path, monkeypatch):
+    """search_objects echoes `pattern` and the profile name into its
+    output and reaches the network, so both its success envelope and its
+    error path are routes to the model."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f"""
+default = "snowflake"
+
+[profiles.snowflake]
+type   = "adbc"
+driver = "/x/libadbc_driver_snowflake.so"
+uri    = "{SF_DSN}"
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(cfg))
+    from lakesh import mcp as lakesh_mcp
+
+    # No driver at /x/, so this fails inside connect_native — the error
+    # path, which is the one that quotes connection details.
+    out = lakesh_mcp.search_objects("revenue")
+    assert PAT not in out
+
+    # And the same via the all_profiles envelope, which reports the
+    # failure per profile rather than raising.
+    out = lakesh_mcp.search_objects("revenue", all_profiles=True)
+    assert PAT not in out
+    assert "snowflake" in out          # still names the profile that failed

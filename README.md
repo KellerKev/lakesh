@@ -450,10 +450,65 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | Tool | Purpose |
 |---|---|
 | `list_profiles()` | Discover what catalogs are configured |
+| `search_objects(pattern, profile=None, namespace=None, match="all", limit=200, all_profiles=False)` | **Find** a schema, table or column by name |
 | `list_namespaces(profile=None)` | List schemas in a profile's catalog |
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
 | `describe_table(namespace, table, profile=None)` | Columns + types + nullability |
 | `query(sql, profile=None, limit=1000, format="json", native=None)` | Run SQL and return results |
+
+### Finding things — `search_objects`
+
+The other navigation tools enumerate; this one searches. Without it an
+agent that doesn't already know where revenue lives can only
+`list_tables` per schema and eyeball the output.
+
+```jsonc
+search_objects("revenue")
+{
+  "pattern": "revenue", "like": "%revenue%", "mode": "native",
+  "results": [
+    {"namespace": "ANALYTICS", "table": null,          "matched_on": ["schema"]},
+    {"namespace": "ANALYTICS", "table": "FCT_REVENUE", "matched_on": ["table"]},
+    {"namespace": "ANALYTICS", "table": "ORDERS",      "matched_on": ["column"],
+     "columns": [{"column": "REVENUE_USD", "type": "NUMBER(38,2)"}]}
+  ],
+  "result_count": 3, "truncated_at": null
+}
+```
+
+Schemas, tables and columns are searched in **one** statement — a
+three-way `UNION ALL` over the source's own `information_schema`,
+filtered and capped on the source, so only matches cross the wire.
+Results are grouped per object: a table matching on six columns is one
+entry, not six, with at most 10 columns listed (`columns_truncated` says
+when there were more).
+
+Pattern rules:
+
+- Matching is **always case-insensitive** (`ILIKE`). It has to be —
+  Snowflake upper-cases unquoted identifiers and Postgres lower-cases
+  them, so the same logical name is spelled two ways depending on which
+  source you ask.
+- A bare word matches anywhere: `revenue` finds `FCT_REVENUE` and
+  `revenue_usd`.
+- `%` is a wildcard **and** switches off the implicit wrap, so
+  `revenue%` is a prefix match.
+- `_` is **literal**, not a single-character wildcard. Analytic table
+  names are full of underscores and nobody types `fact_revenue` meaning
+  `fact<any char>revenue`.
+- A backslash is rejected rather than escaped: escaping differs across
+  sources (Snowflake reads it as an escape inside string literals,
+  Postgres and DuckDB do not), so there is no one right answer.
+
+`namespace` is the main lever for keeping a search fast on a large
+warehouse, and `match="table"` drops the column leg entirely when you
+only want object names. `all_profiles=True` fans out across every
+configured profile — it costs a connection per profile inside a single
+call, and returns a partial-results envelope so one profile with a cold
+token reports itself in `errors` instead of failing the whole search.
+
+`truncated_at` counts **raw matches**, not grouped entries, so it can
+legitimately exceed `result_count`.
 
 `lakesh mcp -c <path>` points the server at a specific config; so does
 `$LAKESH_CONFIG`.
