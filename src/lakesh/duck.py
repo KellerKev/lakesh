@@ -197,6 +197,94 @@ def _connect_adbc(profile: Profile, token: str | None) -> duckdb.DuckDBPyConnect
     return con
 
 
+# --------------------------------------------------------------------------
+# native passthrough — send SQL to the source instead of through the ATTACH
+#
+# Reading through the ATTACHed catalog means DuckDB parses the SQL and
+# adbc_scanner translates scans into ADBC calls, which inherits every
+# limit of that translation layer. Measured against Snowflake:
+#
+#   * `SELECT count(*)` naming no column picks an arbitrary column and
+#     fails to cast it — "Unimplemented type for cast (TIMESTAMP WITH
+#     TIME ZONE -> BIGINT)" on Snowflake, "Could not convert string
+#     '<uuid>' to INT64" on Postgres.
+#   * A second database on the same connection is invisible: one ATTACH
+#     is one database.
+#   * `SHOW`, `QUALIFY` and `LATERAL FLATTEN` never reach the source —
+#     DuckDB parses first, and it doesn't know that dialect.
+#   * Catalog population is eager and serial (one `DESC TABLE` per
+#     object), which is why introspection through the ATTACH costs
+#     minutes against a remote source. See mcp.py.
+#
+# Native mode sidesteps all of it: the statement goes to the source
+# verbatim and comes back as an Arrow result.
+
+
+def adbc_native_handle(
+    con: duckdb.DuckDBPyConnection, profile: Profile, token: str | None = None
+) -> int:
+    """Open a raw ADBC connection via `adbc_connect()` and return its
+    handle. `adbc_connect` takes a struct whose keys must be literal, so
+    keys are identifier-validated — but every *value* is a bound
+    parameter, so no credential ever appears in SQL text. That makes
+    this strictly safer than the ATTACH path, which has to inline
+    non-secret options."""
+    if profile.type != "adbc":
+        raise ConfigError(
+            f"profile {profile.name!r}: native passthrough requires an "
+            f"adbc profile (this one is {profile.type!r})"
+        )
+    keys = ["driver"]
+    params: list[str] = [profile.driver]
+    if profile.uri:
+        keys.append("uri")
+        params.append(profile.uri)
+    for key, value in _adbc_options(profile, token).items():
+        if not _ADBC_OPTION_KEY_RE.match(key):
+            raise ConfigError(
+                f"profile {profile.name!r}: invalid adbc option key {key!r}"
+            )
+        keys.append(key)
+        params.append(value)
+    struct = ", ".join(f"'{key}': ?" for key in keys)
+    row = con.execute(f"SELECT adbc_connect({{{struct}}})", params).fetchone()
+    return row[0]
+
+
+def adbc_native_scan(
+    con: duckdb.DuckDBPyConnection, handle: int, sql: str
+) -> duckdb.DuckDBPyConnection:
+    """Run `sql` on the source through an `adbc_connect` handle. The
+    statement rides as a bound parameter, so the source's own dialect
+    applies and DuckDB never parses it."""
+    return con.execute("SELECT * FROM adbc_scan(?, ?)", [handle, sql])
+
+
+def connect_native(
+    profile: Profile,
+    *,
+    token: str | None = None,
+    interactive: bool = True,
+) -> tuple[duckdb.DuckDBPyConnection, int]:
+    """(connection, handle) for native passthrough — no ATTACH, so none
+    of the eager catalog population happens."""
+    profile.validate()
+    if profile.type != "adbc":
+        raise ConfigError(
+            f"profile {profile.name!r}: native passthrough requires an "
+            f"adbc profile (this one is {profile.type!r})"
+        )
+    if token is None:
+        token = oauth.get_token(profile, interactive=interactive)
+    con = duckdb.connect(":memory:")
+    load_adbc_scanner(con, required=True)
+    try:
+        return con, adbc_native_handle(con, profile, token)
+    except Exception:
+        con.close()
+        raise
+
+
 def _connect_iceberg_rest(profile: Profile, token: str | None) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(":memory:")
     for ext in ("httpfs", "iceberg"):

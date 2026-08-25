@@ -21,7 +21,7 @@ from .config import (
     load_config,
     write_example_config,
 )
-from .duck import catalog_alias, connect
+from .duck import adbc_native_scan, catalog_alias, connect, connect_native
 from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
 from .redact import profile_secrets, redact_option, redact_uri, scrub
@@ -134,12 +134,20 @@ def exec(
     warehouse: Optional[str] = typer.Option(
         None, help="Override the profile's `warehouse` (Iceberg REST profiles only)."
     ),
+    native: bool = typer.Option(
+        False, "--native",
+        help="ADBC profiles: send SQL straight to the source in its own "
+             "dialect instead of through DuckDB's attached catalog. "
+             "Needed for SHOW / QUALIFY / cross-database queries and a "
+             "bare count(*), and far faster against a remote source.",
+    ),
 ):
     """Run a single SQL statement against a profile's catalog and exit.
 
     Example:
         lakesh exec -p prod -q 'SELECT COUNT(*) FROM analytics.events'
         echo 'SELECT 1' | lakesh exec -f json
+        lakesh exec -p snowflake --native -q 'SHOW DATABASES'
     """
     if query is None:
         query = sys.stdin.read()
@@ -162,12 +170,23 @@ def exec(
     if warehouse:
         prof.warehouse = warehouse
 
+    if native and prof.type != "adbc":
+        err_console.print(
+            f"[red]--native requires an adbc profile "
+            f"(profile {prof.name!r} is {prof.type!r})[/red]"
+        )
+        raise typer.Exit(code=2)
+
     # A driver error will happily quote the failing statement with the
     # DSN inline, so everything printed from here on gets scrubbed.
     secrets = profile_secrets(prof)
 
+    handle: Optional[int] = None
     try:
-        con = connect(prof, interactive=sys.stderr.isatty())
+        if native:
+            con, handle = connect_native(prof, interactive=sys.stderr.isatty())
+        else:
+            con = connect(prof, interactive=sys.stderr.isatty())
     except AuthRequired as e:
         err_console.print(f"[red]{scrub(str(e), secrets)}[/red]")
         raise typer.Exit(code=1)
@@ -175,7 +194,7 @@ def exec(
         err_console.print(f"[red]connect failed:[/red] {scrub(str(e), secrets)}")
         raise typer.Exit(code=1)
     try:
-        cur = con.execute(query)
+        cur = adbc_native_scan(con, handle, query) if native else con.execute(query)
         columns = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall()
     except Exception as e:
