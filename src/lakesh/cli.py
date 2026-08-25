@@ -219,7 +219,9 @@ def exec(
 # mcp — run as an MCP server on stdio
 
 @app.command()
-def mcp():
+def mcp(
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+):
     """Run lakesh as an MCP server on stdio.
 
     Exposes `list_profiles`, `list_namespaces`, `list_tables`,
@@ -228,13 +230,15 @@ def mcp():
 
         lakesh mcp
 
-    Reads + writes use the same TOML config the rest of the CLI does.
-    Writes (INSERT / UPDATE / DELETE / DDL) are rejected unless the
-    server is started with `LAKESH_MCP_WRITE=1` in its environment —
-    keeps LLM-driven SQL safe by default.
+    Reads + writes use the same TOML config the rest of the CLI does;
+    `-c` (or `$LAKESH_CONFIG`) points it somewhere else. Writes (INSERT
+    / UPDATE / DELETE / DDL) are rejected unless the server is started
+    with `LAKESH_MCP_WRITE=1` in its environment, and a profile marked
+    `read_only` refuses them regardless — keeps LLM-driven SQL safe by
+    default.
     """
     from .mcp import serve
-    serve()
+    serve(config_path)
 
 
 # --------------------------------------------------------------------------

@@ -479,8 +479,16 @@ def query(
     return _rows_as_table(columns, rows) + f"\n\n({len(rows)} rows, mode={mode})"
 
 
-def serve() -> None:
-    """Run the MCP server on stdio — the entry point `lakesh mcp` calls."""
+def serve(config_path: Path | None = None) -> None:
+    """Run the MCP server on stdio — the entry point `lakesh mcp` calls.
+
+    `config_path` is exported as `$LAKESH_CONFIG` rather than threaded
+    through every tool: the tools each load config on their own (they
+    are stateless by design), and `default_config_path()` already reads
+    that variable first.
+    """
+    if config_path is not None:
+        os.environ["LAKESH_CONFIG"] = str(config_path)
     server.run()
 
 
