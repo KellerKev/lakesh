@@ -587,3 +587,182 @@ def test_search_objects_duckdb_path_binds_parameters(tmp_path, monkeypatch):
     by_table = {r["table"]: r for r in grouped}
     assert by_table[None]["matched_on"] == ["schema"]           # the revenue schema
     assert by_table["fct_orders"]["matched_on"] == ["column"]   # revenue_usd
+
+
+# --------------------------------------------------------------------------
+# deadlines and paging
+
+
+def test_effective_timeout_precedence(adbc_config, monkeypatch):
+    """A profile's timeout is a ceiling, not a default — the same
+    precedent as `read_only` beating LAKESH_MCP_WRITE."""
+    from lakesh.config import Profile
+
+    monkeypatch.delenv("LAKESH_MCP_TIMEOUT_S", raising=False)
+    bare = Profile(name="p")
+    capped = Profile(name="p", query_timeout_s=10.0)
+
+    assert lakesh_mcp._effective_timeout(bare, None) == lakesh_mcp._DEFAULT_TIMEOUT_S
+    assert lakesh_mcp._effective_timeout(bare, 5) == 5
+    assert lakesh_mcp._effective_timeout(bare, 0) is None       # 0 disables
+
+    assert lakesh_mcp._effective_timeout(capped, 5) == 5        # may narrow
+    assert lakesh_mcp._effective_timeout(capped, 999) == 10.0   # may not widen
+    assert lakesh_mcp._effective_timeout(capped, 0) == 10.0     # nor disable
+
+    monkeypatch.setenv("LAKESH_MCP_TIMEOUT_S", "42")
+    assert lakesh_mcp._effective_timeout(bare, None) == 42
+    assert lakesh_mcp._effective_timeout(bare, 7) == 7          # call beats env
+    monkeypatch.setenv("LAKESH_MCP_TIMEOUT_S", "not-a-number")
+    assert lakesh_mcp._effective_timeout(bare, None) == lakesh_mcp._DEFAULT_TIMEOUT_S
+
+
+def test_paginate_leaves_offset_zero_untouched():
+    """The common path must be byte-identical to what it was before
+    pagination existed."""
+    assert lakesh_mcp._paginate("SELECT 1", 100, 0) == ("SELECT 1", False)
+
+
+def test_paginate_wraps_and_fetches_a_sentinel():
+    """The SQL LIMIT is limit+1 to match the caller's fetch. Capping it
+    at `limit` makes every full page look like the last one."""
+    sql, wrapped = lakesh_mcp._paginate("SELECT n FROM t", 3, 3)
+    assert wrapped is True
+    assert sql == "SELECT * FROM (SELECT n FROM t) AS _lakesh_page LIMIT 4 OFFSET 3"
+
+
+@pytest.mark.parametrize("sql", [
+    "SHOW DATABASES", "EXPLAIN SELECT 1", "PRAGMA version", "DESCRIBE t",
+])
+def test_paginate_skips_statements_that_are_not_relations(sql):
+    """DuckDB tolerates a wrapped SHOW, but the same string goes to
+    Snowflake where SHOW is not selectable — so it stays on the
+    client-side skip path for both."""
+    assert lakesh_mcp._paginate(sql, 10, 5) == (sql, False)
+
+
+def test_query_offset_wraps_the_statement(adbc_config, fake_native):
+    lakesh_mcp.query("SELECT 1", profile="snow", limit=10, offset=20)
+    assert fake_native.statements == [
+        "SELECT * FROM (SELECT 1) AS _lakesh_page LIMIT 11 OFFSET 20"
+    ]
+
+
+def test_query_offset_zero_sends_sql_verbatim(adbc_config, fake_native):
+    lakesh_mcp.query("SELECT 1", profile="snow")
+    assert fake_native.statements == ["SELECT 1"]
+
+
+def test_query_rejects_offset_past_the_cap(adbc_config, fake_native):
+    out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow", offset=10**9))
+    assert "exceeds" in out["error"]
+    assert fake_native.statements == []
+
+
+def test_query_warns_when_paging_without_order_by(adbc_config, fake_native):
+    """Each page is a separate execution, so unordered paging genuinely
+    duplicates and skips rows — not a theoretical risk."""
+    out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow", offset=5))
+    assert any("ORDER BY" in w for w in out["warnings"])
+
+    out = json.loads(lakesh_mcp.query(
+        "SELECT 1 ORDER BY 1", profile="snow", offset=5))
+    assert "warnings" not in out
+
+    # No offset, no warning — the statement is run once, order is moot.
+    out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow"))
+    assert "warnings" not in out
+
+
+def test_query_has_more_is_exact(adbc_config, monkeypatch):
+    """`truncated_at` cannot tell "exactly limit rows" from "truncated";
+    `has_more` can, because a sentinel row is fetched."""
+    con = _FakeNativeConnection(columns=("n",), rows=[(i,) for i in range(3)])
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+
+    out = json.loads(lakesh_mcp.query("SELECT n FROM t", profile="snow", limit=2))
+    assert out["row_count"] == 2
+    assert out["has_more"] is True and out["next_offset"] == 2
+    assert out["truncated_at"] == 2
+
+    out = json.loads(lakesh_mcp.query("SELECT n FROM t", profile="snow", limit=3))
+    assert out["has_more"] is False and out["next_offset"] is None
+    # ...whereas the legacy field still cries wolf on an exactly-full page.
+    assert out["truncated_at"] == 3
+
+
+def test_query_reports_how_the_deadline_was_enforced(adbc_config, fake_native):
+    """Native mode cannot promise a hard deadline, so it must not claim
+    one: a statement blocked inside the driver does not observe an
+    interrupt until the driver returns."""
+    out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow"))
+    assert out["enforced"] == "best_effort"
+
+    out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow", timeout_s=0))
+    assert out["enforced"] == "none"
+
+
+def test_query_timeout_payload_is_typed(adbc_config, monkeypatch):
+    from lakesh.duck import QueryTimeout
+
+    def _boom(prof, **kw):
+        raise QueryTimeout(3.0, 30.0, hard=False)
+
+    monkeypatch.setattr(lakesh_mcp, "connect_native", _boom)
+    out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow", timeout_s=3))
+    assert out["error_type"] == "timeout"
+    assert out["timeout_s"] == 3.0 and out["elapsed_s"] == 30.0
+    assert out["enforced"] == "best_effort"
+    assert "could not abort" in out["hint"]
+
+
+def test_deadline_hard_aborts_the_duckdb_path():
+    """The one path where the deadline is real. Deterministic: measured
+    at 2.00s for a 2s deadline."""
+    import duckdb as _duckdb
+    from lakesh.duck import QueryTimeout, deadline
+
+    con = _duckdb.connect()
+    with pytest.raises(QueryTimeout) as excinfo:
+        with deadline(con, 1.0):
+            con.execute(
+                "SELECT count(*) FROM range(30000000000) t(i) WHERE i%7=3"
+            ).fetchall()
+    assert excinfo.value.hard is True
+    # The connection survives an interrupt and is still closeable, which
+    # is why _open/_open_native need no change.
+    assert con.execute("SELECT 1").fetchone() == (1,)
+    con.close()
+
+
+def test_deadline_is_a_noop_without_seconds():
+    import duckdb as _duckdb
+    from lakesh.duck import deadline
+
+    con = _duckdb.connect()
+    for seconds in (None, 0):
+        with deadline(con, seconds):
+            assert con.execute("SELECT 1").fetchone() == (1,)
+    con.close()
+
+
+def test_idle_interrupt_does_not_poison_the_connection():
+    """The watchdog can fire in the race between the final fetch and
+    timer.cancel(); that has to be harmless or the design needs a lock."""
+    import duckdb as _duckdb
+
+    con = _duckdb.connect()
+    con.interrupt()
+    assert con.execute("SELECT 1").fetchone() == (1,)
+    assert con.execute("SELECT 2").fetchone() == (2,)
+    con.close()
+
+
+def test_driver_timeout_sql_is_per_driver():
+    from lakesh.duck import _driver_timeout_sql
+
+    pg = _driver_timeout_sql("/x/libadbc_driver_postgresql.so", 3)
+    assert "set_config('statement_timeout', '3000', false)" in pg
+    sf = _driver_timeout_sql("snowflake", 3)
+    assert "STATEMENT_TIMEOUT_IN_SECONDS = 3" in sf
+    assert _driver_timeout_sql("sqlite", 3) is None

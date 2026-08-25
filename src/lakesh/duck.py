@@ -34,6 +34,10 @@ from __future__ import annotations
 
 import re
 import sys
+import threading
+import time
+from contextlib import contextmanager
+from typing import Iterator
 
 import duckdb
 
@@ -260,14 +264,151 @@ def adbc_native_scan(
     return con.execute("SELECT * FROM adbc_scan(?, ?)", [handle, sql])
 
 
+# --------------------------------------------------------------------------
+# deadlines
+#
+# Two mechanisms, because one is not enough and pretending otherwise
+# would be a lie to the caller.
+#
+# `interrupt()` is a hard deadline on the pure DuckDB path — measured at
+# exactly 2.00s for a 2s deadline. It is NOT one on the native path: a
+# statement blocked inside adbc_scan waiting for the source's first byte
+# does not observe the interrupt until the driver returns control, so a
+# 2s deadline on `SELECT pg_sleep(30)` returned after 30.01s. Mid-stream
+# it lands sooner (5.63s on a 20M-row scan) but still lags by the
+# driver's buffer size.
+#
+# So for adbc profiles we *also* ask the source to enforce its own
+# statement timeout, which is the only thing that actually bounds wall
+# clock there.
+
+
+_DRIVER_TIMEOUT_RE = re.compile(
+    r"statement timeout|canceling statement|query reached its timeout|"
+    r"execution time exceeded",
+    re.IGNORECASE,
+)
+
+
+class QueryTimeout(Exception):
+    """A statement blew its deadline.
+
+    `hard` says whether the deadline was actually enforced — the caller
+    needs to know the difference between "we stopped it" and "we asked
+    and it stopped when it felt like it"."""
+
+    def __init__(self, seconds: float, elapsed: float, hard: bool) -> None:
+        self.seconds, self.elapsed, self.hard = seconds, elapsed, hard
+        super().__init__(
+            f"query exceeded the {seconds:g}s deadline "
+            f"(returned after {elapsed:.1f}s)"
+        )
+
+
+@contextmanager
+def deadline(
+    con: duckdb.DuckDBPyConnection, seconds: float | None
+) -> Iterator[None]:
+    """Interrupt `con`'s in-flight statement after `seconds`.
+
+    The whole execute *and* fetch must happen inside the block:
+    `adbc_scan` streams, so most of the wall clock is in the fetch.
+
+    Firing `interrupt()` with nothing running is a harmless no-op that
+    does not poison the next statement (verified on DuckDB 1.5.2), so
+    the race between the final fetch and `timer.cancel()` needs no lock.
+    """
+    if not seconds or seconds <= 0:
+        yield
+        return
+    fired = threading.Event()
+    started = time.monotonic()
+
+    def _fire() -> None:
+        fired.set()
+        try:
+            con.interrupt()
+        except Exception:      # already closed — nothing left to abort
+            pass
+
+    timer = threading.Timer(seconds, _fire)
+    timer.daemon = True        # never hold up interpreter shutdown
+    timer.start()
+    try:
+        yield
+    except duckdb.InterruptException as e:
+        if not fired.is_set():
+            raise              # somebody else's interrupt; don't relabel it
+        elapsed = time.monotonic() - started
+        raise QueryTimeout(seconds, elapsed, hard=elapsed < seconds * 1.5) from e
+    except duckdb.Error as e:
+        # The source's own statement timeout, if it beat the watchdog to
+        # it. In practice the watchdog fires first (it is armed at the
+        # same number of seconds the driver takes 2x to honour), but a
+        # raw "canceling statement due to statement timeout" reaching the
+        # caller as a generic IO error would be needlessly opaque.
+        if not _DRIVER_TIMEOUT_RE.search(str(e)):
+            raise
+        elapsed = time.monotonic() - started
+        raise QueryTimeout(seconds, elapsed, hard=False) from e
+    finally:
+        timer.cancel()
+
+
+def _driver_timeout_sql(driver: str, seconds: float) -> str | None:
+    """The source's own statement timeout, when it has one we can set
+    over the same connection. Matching is a substring test because
+    `driver` is usually a path to a shared library."""
+    d = driver.lower()
+    if "postgres" in d:
+        # Verified: returns ('3s',) and the next statement dies with
+        # "canceling statement due to statement timeout". Note the
+        # driver pays the timeout twice — once on PREPARE and once on
+        # COPY — so wall clock is 2x what is configured. Don't halve it
+        # to compensate: the multiplier is a driver detail, and the
+        # error reports what actually happened.
+        return f"SELECT set_config('statement_timeout', '{int(seconds * 1000)}', false)"
+    if "snowflake" in d:
+        # Reasoned from the docs, not yet measured against an account —
+        # callers are told `best_effort` until it is.
+        return f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {int(seconds)}"
+    return None
+
+
+def arm_driver_timeout(
+    con: duckdb.DuckDBPyConnection, handle: int, profile: Profile,
+    seconds: float | None,
+) -> bool:
+    """Ask the source to enforce `seconds` itself. True if it accepted.
+
+    Best-effort by design: a source that rejects the statement still
+    gets the watchdog, and failing the query because we could not arm a
+    timeout would be worse than the timeout being soft.
+    """
+    if not seconds or seconds <= 0:
+        return False
+    sql = _driver_timeout_sql(profile.driver, seconds)
+    if not sql:
+        return False
+    try:
+        adbc_native_scan(con, handle, sql).fetchall()
+        return True
+    except Exception:
+        return False
+
+
 def connect_native(
     profile: Profile,
     *,
     token: str | None = None,
     interactive: bool = True,
+    timeout_s: float | None = None,
 ) -> tuple[duckdb.DuckDBPyConnection, int]:
     """(connection, handle) for native passthrough — no ATTACH, so none
-    of the eager catalog population happens."""
+    of the eager catalog population happens.
+
+    `timeout_s` additionally arms the source's own statement timeout
+    where the driver has one; see `arm_driver_timeout`."""
     profile.validate()
     if profile.type != "adbc":
         raise ConfigError(
@@ -279,10 +420,12 @@ def connect_native(
     con = duckdb.connect(":memory:")
     load_adbc_scanner(con, required=True)
     try:
-        return con, adbc_native_handle(con, profile, token)
+        handle = adbc_native_handle(con, profile, token)
     except Exception:
         con.close()
         raise
+    arm_driver_timeout(con, handle, profile, timeout_s)
+    return con, handle
 
 
 def _connect_iceberg_rest(profile: Profile, token: str | None) -> duckdb.DuckDBPyConnection:

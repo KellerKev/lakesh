@@ -76,7 +76,14 @@ import duckdb
 from mcp.server.fastmcp import FastMCP
 
 from .config import Config, ConfigError, Profile, default_config_path, load_config
-from .duck import adbc_native_scan, catalog_alias, connect, connect_native
+from .duck import (
+    QueryTimeout,
+    adbc_native_scan,
+    catalog_alias,
+    connect,
+    connect_native,
+    deadline,
+)
 from .oauth import AuthRequired
 from .output import _stringify  # type: ignore[attr-defined]
 from .redact import profile_secrets, redact_uri, scrub
@@ -179,14 +186,83 @@ def _ilike(column: str, like: str) -> str:
 
 
 @contextmanager
-def _open_native(profile_name: str | None) -> Iterator[tuple[duckdb.DuckDBPyConnection, int, Profile]]:
+def _open_native(
+    profile_name: str | None, timeout_s: float | None = None
+) -> Iterator[tuple[duckdb.DuckDBPyConnection, int, Profile]]:
     cfg = _load_or_raise()
     prof = cfg.get(profile_name)
-    con, handle = connect_native(prof, interactive=False)
+    con, handle = connect_native(prof, interactive=False, timeout_s=timeout_s)
     try:
         yield con, handle, prof
     finally:
         con.close()
+
+
+# --------------------------------------------------------------------------
+# deadlines and paging
+
+# Chosen to sit below the request timeout of a typical MCP client, so a
+# slow query comes back as a labelled error the model can act on rather
+# than as `MCP error -32001`, which is indistinguishable from a dead
+# server.
+_DEFAULT_TIMEOUT_S = 120.0
+
+
+def _effective_timeout(prof: Profile, requested: float | None) -> float | None:
+    """Resolve the deadline. A profile's `query_timeout_s` is a ceiling,
+    not a default: the same precedent as `read_only` beating
+    `LAKESH_MCP_WRITE`, where config is the operator's binding statement
+    of intent and a caller may narrow it but never widen it."""
+    if requested is not None:
+        base: float | None = float(requested)
+    else:
+        env = os.environ.get("LAKESH_MCP_TIMEOUT_S")
+        try:
+            base = float(env) if env else _DEFAULT_TIMEOUT_S
+        except ValueError:
+            base = _DEFAULT_TIMEOUT_S
+    if base is not None and base <= 0:
+        base = None                       # 0 means "no deadline"
+    if prof.query_timeout_s is not None:
+        return prof.query_timeout_s if base is None else min(base, prof.query_timeout_s)
+    return base
+
+
+# Statements that are not relations and so cannot be wrapped in a
+# derived table. DuckDB actually tolerates `SHOW`, but the same string
+# goes to Snowflake where SHOW is not selectable, so it stays on the
+# client-side skip path for both.
+_UNWRAPPABLE = re.compile(r"^\s*(explain|pragma|show|desc|describe)\b", re.IGNORECASE)
+
+# Only ever used to *add* a warning, never to reject or rewrite — so it
+# does not matter that it cannot tell a top-level ORDER BY from one
+# inside a CTE or a window frame.
+_HAS_ORDER_BY = re.compile(r"\border\s+by\b", re.IGNORECASE)
+
+_MAX_OFFSET = 100_000
+
+
+def _paginate(sql: str, limit: int, offset: int) -> tuple[str, bool]:
+    """(statement, wrapped). `wrapped` false means the caller has to skip
+    rows client-side, which transfers them and throws them away.
+
+    At offset 0 the statement is returned byte-for-byte unchanged, so the
+    common path is exactly what it was before pagination existed.
+    """
+    if offset <= 0 or _UNWRAPPABLE.match(sql.strip().lstrip("(")):
+        return sql, False
+    # `AS _lakesh_page` is required by Postgres < 16. The trailing `;` has
+    # already been stripped by the caller, which is load-bearing: a
+    # semicolon inside the subquery is a syntax error.
+    #
+    # LIMIT is `limit + 1`, matching the caller's fetch: the extra row is
+    # the sentinel that makes `has_more` exact. Capping the SQL at
+    # `limit` instead makes every full page look like the last one.
+    return (
+        f"SELECT * FROM ({sql}) AS _lakesh_page "
+        f"LIMIT {int(limit) + 1} OFFSET {int(offset)}",
+        True,
+    )
 
 
 def _native(con: duckdb.DuckDBPyConnection, handle: int, sql: str) -> tuple[list[str], list[tuple]]:
@@ -733,8 +809,10 @@ def query(
     sql: str,
     profile: str | None = None,
     limit: int = 1000,
+    offset: int = 0,
     format: str = "json",
     native: bool | None = None,
+    timeout_s: float | None = None,
 ) -> str:
     """Run a SQL statement and return its result.
 
@@ -750,6 +828,13 @@ def query(
         profile: which configured profile to run against. Omit for default.
         limit: max rows returned. Hard-capped at 10000 to keep the
                response payload tractable for the LLM.
+        offset: skip this many rows. Each page is a SEPARATE EXECUTION of
+                the statement — there is no cursor held between calls —
+                so paging a warehouse query N times costs N runs of it.
+                Fine for a second page, expensive for a sweep. Pagination
+                without a top-level `ORDER BY` is not stable across
+                pages; the response says so in `warnings` when it spots
+                one missing.
         format: `json` (default) — array of {col: value} objects,
                 machine-readable. `table` — fixed-width text, easier for
                 the LLM to summarise.
@@ -761,6 +846,19 @@ def query(
                 the only way to join the source against a local Parquet
                 file in one statement. Ignored for non-adbc profiles.
                 The mode that actually ran is reported as `mode`.
+        timeout_s: deadline in seconds; 120 by default, 0 to disable. A
+                profile's `query_timeout_s` is a ceiling this can lower
+                but not raise. How well it is enforced differs by path
+                and the response says which applied via `enforced`:
+                `hard` on the DuckDB path, where the query is genuinely
+                aborted on the deadline; `best_effort` in native mode,
+                where a statement blocked waiting on the source cannot be
+                interrupted until the driver returns control. In native
+                mode lakesh also asks the source to enforce its own
+                statement timeout where the driver supports it — on
+                Postgres that lands at roughly 2x the requested seconds,
+                because the driver applies it once on prepare and once on
+                fetch.
 
     Writes (INSERT / UPDATE / DELETE / DDL / DROP) are rejected unless
     the server was started with `LAKESH_MCP_WRITE=1` in its environment.
@@ -774,6 +872,14 @@ def query(
         return json.dumps({"error": "empty query"})
 
     limit = max(1, min(int(limit), 10_000))
+    offset = max(0, int(offset))
+    if offset > _MAX_OFFSET:
+        return json.dumps({
+            "error": f"offset {offset} exceeds the {_MAX_OFFSET} cap. Each "
+                     f"page re-executes the statement, so walking a source "
+                     f"page by page is not the right tool — narrow the query "
+                     f"or aggregate instead.",
+        })
     if format not in ("json", "table"):
         return json.dumps({"error": f"unknown format {format!r}"})
 
@@ -800,32 +906,87 @@ def query(
     if use_native and prof.type != "adbc":
         use_native = False
 
+    mode = "native" if use_native else "duckdb"
+    timeout = _effective_timeout(prof, timeout_s)
+    # A hard deadline needs DuckDB to be the one blocked. In native mode
+    # the statement sits inside the driver, which does not observe the
+    # interrupt until it returns.
+    enforced = "best_effort" if (use_native and timeout) else (
+        "hard" if timeout else "none"
+    )
+    paged_sql, wrapped = _paginate(sql, limit, offset)
+    # One row past the limit, so "exactly `limit` rows" is distinguishable
+    # from "more to come" instead of guessed at.
+    want = limit + 1
+
     try:
         if use_native:
-            with _open_native(profile) as (con, handle, _prof):
-                cur = adbc_native_scan(con, handle, sql)
-                columns = [d[0] for d in cur.description] if cur.description else []
-                rows = cur.fetchmany(limit)
+            with _open_native(profile, timeout) as (con, handle, _prof):
+                with deadline(con, timeout):
+                    cur = adbc_native_scan(con, handle, paged_sql)
+                    columns = [d[0] for d in cur.description] if cur.description else []
+                    if offset and not wrapped:
+                        cur.fetchmany(offset)   # unwrappable: skip client-side
+                    rows = cur.fetchmany(want)
         else:
             with _open(profile) as (con, _catalog):
-                cur = con.execute(sql)
-                columns = [d[0] for d in cur.description] if cur.description else []
-                rows = cur.fetchmany(limit)
+                with deadline(con, timeout):
+                    cur = con.execute(paged_sql)
+                    columns = [d[0] for d in cur.description] if cur.description else []
+                    if offset and not wrapped:
+                        cur.fetchmany(offset)
+                    rows = cur.fetchmany(want)
+    except QueryTimeout as e:
+        return json.dumps({
+            "error": scrub(str(e), _KNOWN_SECRETS),
+            "error_type": "timeout",
+            "timeout_s": e.seconds,
+            "elapsed_s": round(e.elapsed, 1),
+            "enforced": "hard" if e.hard else "best_effort",
+            "mode": mode,
+            "hint": (
+                "the deadline aborted the query"
+                if e.hard else
+                "the deadline could not abort the in-flight driver call; "
+                "narrow the query or add a LIMIT"
+            ),
+        })
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
         return _error(e)
 
-    mode = "native" if use_native else "duckdb"
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    warnings: list[str] = []
+    if offset and not _HAS_ORDER_BY.search(sql):
+        warnings.append(
+            "no ORDER BY detected: each page is a separate execution of the "
+            "statement, so row order is not stable across pages and rows may "
+            "be duplicated or skipped. Add an ORDER BY on a unique column."
+        )
     if not columns:
         return json.dumps({"ok": True, "rows": 0, "mode": mode, "note": "no result set"})
     if format == "json":
-        return json.dumps({
+        payload: dict[str, Any] = {
             "columns": columns,
             "rows": [{c: _jsonable(v) for c, v in zip(columns, row)} for row in rows],
             "row_count": len(rows),
+            # Kept for compatibility; `has_more` is the accurate signal.
+            # This one cannot tell "exactly `limit` rows" from "truncated".
             "truncated_at": limit if len(rows) >= limit else None,
+            "has_more": has_more,
+            "next_offset": offset + len(rows) if has_more else None,
             "mode": mode,
-        }, default=str)
-    return _rows_as_table(columns, rows) + f"\n\n({len(rows)} rows, mode={mode})"
+            "enforced": enforced,
+        }
+        if offset:
+            payload["offset"] = offset
+        if warnings:
+            payload["warnings"] = warnings
+        return json.dumps(payload, default=str)
+    footer = f"\n\n({len(rows)} rows, mode={mode}"
+    if has_more:
+        footer += f", more from offset {offset + len(rows)}"
+    return _rows_as_table(columns, rows) + footer + ")"
 
 
 def serve(config_path: Path | None = None) -> None:

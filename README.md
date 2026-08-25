@@ -454,7 +454,7 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `list_namespaces(profile=None)` | List schemas in a profile's catalog |
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
 | `describe_table(namespace, table, profile=None)` | Columns + types + nullability |
-| `query(sql, profile=None, limit=1000, format="json", native=None)` | Run SQL and return results |
+| `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None)` | Run SQL and return results |
 
 ### Finding things — `search_objects`
 
@@ -525,6 +525,73 @@ A profile with `read_only = true` refuses writes **even with
 `LAKESH_MCP_WRITE=1`** — the profile is the more specific statement of
 intent, and native passthrough opens its own ADBC connection that the
 ATTACH's `READ_ONLY` flag never sees.
+
+### Deadlines
+
+`query` applies a **120-second deadline by default**. Without one a slow
+query hangs the client, which reports `MCP error -32001: Request timed
+out` — indistinguishable from a dead server, and a real diagnostic
+time-sink. A server-side deadline returns a labelled error the model can
+act on instead.
+
+Override per call with `timeout_s` (`0` disables), for the whole server
+with `LAKESH_MCP_TIMEOUT_S`, or per profile:
+
+```toml
+[profiles.snowflake]
+query_timeout_s = 60
+```
+
+A profile's `query_timeout_s` is a **ceiling**, not a default: a caller
+may ask for less but never more. Same precedent as `read_only` beating
+`LAKESH_MCP_WRITE` — config is the operator's binding statement of
+intent.
+
+**How well the deadline is enforced depends on the path, and the
+response says which applied** via `enforced`:
+
+- `hard` — the DuckDB path. Measured at exactly 2.00s for a 2s deadline.
+- `best_effort` — native mode. DuckDB's `interrupt()` cannot abort a
+  statement blocked inside the ADBC driver waiting on the source: a 2s
+  deadline on `SELECT pg_sleep(30)` returned after **30.01s**. So in
+  native mode lakesh *also* asks the source to enforce its own statement
+  timeout where the driver has one (`set_config('statement_timeout', …)`
+  on Postgres, `ALTER SESSION` on Snowflake). On Postgres that lands at
+  roughly **2×** the requested seconds, because the driver applies the
+  timeout once on prepare and once on fetch. Across three identical runs
+  of a 3s deadline we measured 6.0s, 6.0s and 3.0s — which is exactly why
+  `enforced` and `elapsed_s` are reported per call rather than promised
+  up front.
+
+Timeout errors carry `error_type: "timeout"` so a model can branch on
+them rather than pattern-match the message.
+
+### Pagination
+
+`offset` pages past the `limit` cap:
+
+```jsonc
+query("SELECT n FROM t ORDER BY n", limit=3, offset=3)
+{"rows": [...], "row_count": 3, "offset": 3,
+ "has_more": true, "next_offset": 6, "enforced": "best_effort"}
+```
+
+Follow `next_offset` until it is `null`. `has_more` is **exact** — a
+sentinel row past the limit is fetched — unlike the older
+`truncated_at`, which cannot distinguish "exactly `limit` rows" from
+"truncated" and is kept only for compatibility.
+
+Two things to know:
+
+- **Each page re-executes the statement.** Tools are stateless by
+  design: the connection closes when the call returns, so there is no
+  cursor to resume. A second page is cheap; a fifty-page sweep is fifty
+  warehouse executions. `offset` is capped at 100,000 to make that hard
+  to do by accident.
+- **Paging without a top-level `ORDER BY` is not stable**, and because
+  every page is a separate execution that is a real risk rather than a
+  theoretical one. The response adds a `warnings` entry when it doesn't
+  see one.
 
 ### Credentials never reach the model
 

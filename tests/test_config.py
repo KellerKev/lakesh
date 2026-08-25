@@ -549,3 +549,67 @@ driver  = "postgresql"
 uri_env = "LAKESH_TEST_URI_DSN"
 """)
     assert load_config(p).get("a").uri == "postgresql://u:pw@h:5432/db"
+
+
+# --------------------------------------------------------------------------
+# query_timeout_s
+
+
+def test_query_timeout_parses(tmp_path):
+    p = _write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type            = "adbc"
+driver          = "postgresql"
+uri             = "postgresql://u@h/db"
+query_timeout_s = 45
+""")
+    assert load_config(p).get("pg").query_timeout_s == 45.0
+
+
+def test_query_timeout_defaults_to_unset(tmp_path):
+    """Unset means "accept the server's default", not "no deadline" —
+    the two have to stay distinguishable for the ceiling rule to work."""
+    p = _write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+""")
+    assert load_config(p).get("pg").query_timeout_s is None
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_query_timeout_rejects_non_positive(tmp_path, value):
+    p = _write(tmp_path, f"""
+default = "pg"
+
+[profiles.pg]
+type            = "adbc"
+driver          = "postgresql"
+uri             = "postgresql://u@h/db"
+query_timeout_s = {value}
+""")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "query_timeout_s" in str(e.value) and "pg" in str(e.value)
+
+
+def test_query_timeout_rejects_non_numeric(tmp_path):
+    """Coerced at parse time so the error names the profile, rather than
+    a bare ValueError escaping from the dataclass construction."""
+    p = _write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type            = "adbc"
+driver          = "postgresql"
+uri             = "postgresql://u@h/db"
+query_timeout_s = "half an hour"
+""")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "must be a number" in str(e.value)

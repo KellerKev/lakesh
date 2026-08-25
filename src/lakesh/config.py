@@ -140,6 +140,11 @@ class Profile:
     token_option: str = ""
     """Which ADBC option key receives the OAuth bearer token."""
     read_only: bool = False
+    query_timeout_s: float | None = None
+    """Per-query deadline. When set this is a *ceiling*: a caller may ask
+    for less but never more, the same way `read_only` cannot be widened
+    by `LAKESH_MCP_WRITE`. Unset means the MCP server's own default
+    applies."""
     # shared
     s3: S3Config = field(default_factory=S3Config)
     oauth: OAuthConfig = field(default_factory=OAuthConfig)
@@ -294,6 +299,31 @@ def _parse_options(raw: dict) -> dict[str, str]:
     return out
 
 
+def _parse_timeout(name: str, value: Any) -> float | None:
+    """`query_timeout_s`, as a positive number of seconds or unset.
+
+    Coerced here rather than in `validate()` so a non-numeric value
+    raises a `ConfigError` naming the profile instead of a bare
+    `ValueError` from the dataclass construction — the same reason
+    `redirect_port` guards for None before `int()`.
+    """
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"profile {name!r}: `query_timeout_s` must be a number of "
+            f"seconds, got {value!r}"
+        ) from None
+    if seconds <= 0:
+        raise ConfigError(
+            f"profile {name!r}: `query_timeout_s` must be greater than zero "
+            f"(got {seconds!r}); omit the key to accept the default"
+        )
+    return seconds
+
+
 def _parse_profile(name: str, raw: dict) -> Profile:
     s3_raw = raw.get("s3") or {}
     s3 = S3Config(
@@ -348,6 +378,7 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         options=_parse_options(options_raw),
         token_option=str(raw.get("token_option", "")),
         read_only=bool(raw.get("read_only", False)),
+        query_timeout_s=_parse_timeout(name, raw.get("query_timeout_s")),
         s3=s3,
         oauth=oauth,
     )
@@ -471,6 +502,10 @@ path_style = true
 # uri_env   = "LAKESH_SNOWFLAKE_DSN"                  # "USER:PAT@MYORG-ACCOUNT"
 # catalog   = "snow"
 # read_only = true
+#
+# # A per-query deadline. This is a CEILING: a caller may ask for less
+# # but never more, the same way read_only can't be widened.
+# query_timeout_s = 60
 #
 # [profiles.snowflake.options]
 # "adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"    # required

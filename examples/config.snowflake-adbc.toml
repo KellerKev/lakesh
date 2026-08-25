@@ -21,6 +21,7 @@ driver    = "/path/to/site-packages/adbc_driver_snowflake/libadbc_driver_snowfla
 uri_env   = "LAKESH_SNOWFLAKE_DSN"   # "USER:PAT@ACCOUNT" — see below
 catalog   = "snow"                   # tables appear as snow.<schema>.<table>
 read_only = true                     # refuses writes even with LAKESH_MCP_WRITE=1
+# query_timeout_s = 60               # ceiling; a caller may ask for less, never more
 
 [profiles.snowflake.options]
 "adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"   # required — see below
