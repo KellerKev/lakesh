@@ -766,3 +766,91 @@ def test_driver_timeout_sql_is_per_driver():
     sf = _driver_timeout_sql("snowflake", 3)
     assert "STATEMENT_TIMEOUT_IN_SECONDS = 3" in sf
     assert _driver_timeout_sql("sqlite", 3) is None
+
+
+# --------------------------------------------------------------------------
+# pre-flight estimates
+#
+# The rule these protect: emit a number only when one was genuinely
+# extracted. A model that reads `estimated_rows: 0` concludes the query
+# is free.
+
+
+def test_estimate_unavailable_on_postgres_native(tmp_path, monkeypatch):
+    """The Postgres ADBC driver wraps every statement in COPY (...) TO
+    STDOUT, which rejects EXPLAIN. The routing advice is the whole value
+    of the answer on this source, so it must not just fail."""
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "pg"
+
+[profiles.pg]
+type    = "adbc"
+driver  = "/x/libadbc_driver_postgresql.so"
+uri     = "postgresql://u@h/db"
+catalog = "pg"
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    con = _FakeNativeConnection()
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+
+    out = json.loads(lakesh_mcp.query("SELECT * FROM t", estimate=True))
+    assert out["method"] == "unavailable"
+    assert "COPY" in out["reason"] and 'estimate="count"' in out["reason"]
+    assert "estimated_rows" not in out
+    # And crucially: it did not run the statement to find that out.
+    assert con.statements == []
+
+
+def test_estimate_count_builds_a_probe(adbc_config, monkeypatch):
+    con = _FakeNativeConnection(columns=("n",), rows=[(4013113,)])
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+
+    out = json.loads(lakesh_mcp.query("SELECT * FROM t", estimate="count"))
+    assert con.statements == ["SELECT count(*) AS n FROM (SELECT * FROM t) AS _lakesh_est"]
+    assert out["method"] == "count"
+    assert out["exact_rows"] == 4013113
+    # It executed a scan on the source; say so rather than implying it
+    # was a free lookup.
+    assert "not free" in out["note"]
+
+
+def test_estimate_rejects_unknown_mode(adbc_config, fake_native):
+    out = json.loads(lakesh_mcp.query("SELECT 1", estimate="guess"))
+    assert "unknown estimate" in out["error"]
+    assert fake_native.statements == []
+
+
+def test_estimate_and_offset_are_exclusive(adbc_config, fake_native):
+    out = json.loads(lakesh_mcp.query("SELECT 1", estimate=True, offset=10))
+    assert "mutually exclusive" in out["error"]
+    assert fake_native.statements == []
+
+
+def test_estimate_false_runs_the_query_normally(adbc_config, fake_native):
+    out = json.loads(lakesh_mcp.query("SELECT 1", estimate=False))
+    assert "estimate" not in out
+    assert fake_native.statements == ["SELECT 1"]
+
+
+def test_duckdb_cardinality_parses_a_real_plan():
+    """`Estimated Cardinality` is an unpinned DuckDB internal, and the
+    plan arrives as a JSON *list* holding the root node — assuming a dict
+    silently yields None. Worth a real connection rather than a fixture."""
+    import duckdb as _duckdb
+
+    con = _duckdb.connect()
+    con.execute("CREATE TABLE t AS SELECT i FROM range(100000) t(i)")
+    rows = con.execute("EXPLAIN (FORMAT json) SELECT * FROM t WHERE i % 3 = 0").fetchall()
+    estimate = lakesh_mcp._duckdb_cardinality(rows)
+    assert isinstance(estimate, int) and estimate > 0
+    con.close()
+
+
+@pytest.mark.parametrize("plan", [
+    [("physical_plan", "not json at all")],
+    [("physical_plan", '[{"name":"X","children":[],"extra_info":{}}]')],
+    [],
+])
+def test_duckdb_cardinality_returns_none_rather_than_guessing(plan):
+    assert lakesh_mcp._duckdb_cardinality(plan) is None

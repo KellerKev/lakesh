@@ -454,7 +454,7 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `list_namespaces(profile=None)` | List schemas in a profile's catalog |
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
 | `describe_table(namespace, table, profile=None)` | Columns + types + nullability |
-| `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None)` | Run SQL and return results |
+| `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None, estimate=False)` | Run SQL and return results |
 
 ### Finding things — `search_objects`
 
@@ -592,6 +592,42 @@ Two things to know:
   every page is a separate execution that is a real risk rather than a
   theoretical one. The response adds a `warnings` entry when it doesn't
   see one.
+
+### Sizing a query before running it
+
+On a metered warehouse, execution is money. `estimate` answers "how big
+is this" **instead of** running the statement:
+
+```jsonc
+query("SELECT * FROM t WHERE i % 3 = 0", estimate=true, native=false)
+{"estimate": true, "mode": "duckdb", "method": "explain",
+ "estimated_rows": 200000, "plan": "…", "note": "optimizer estimate, not a count"}
+```
+
+`estimate="count"` instead wraps the statement in `count(*)` for an
+**exact** figure. That is opt-in and never an automatic fallback,
+because it executes the scan on the source — spending credits the agent
+did not knowingly authorise would be a bad default.
+
+What a source can honestly report differs, so `method` says which
+happened:
+
+| Source | `method` | Numbers |
+|---|---|---|
+| DuckDB path | `explain` | `estimated_rows` from the optimizer, plus the plan |
+| Snowflake native | `explain` | plan verbatim — the shape is unverified here, so it is not parsed into numbers we can't vouch for |
+| Postgres native | `unavailable` | none — see below |
+
+**Postgres over ADBC cannot EXPLAIN at all.** The driver wraps every
+statement in `COPY (...) TO STDOUT`, and Postgres rejects
+`COPY (EXPLAIN ...)` with a syntax error (the same is true of `SHOW` and
+`SET`). Rather than fail opaquely, the response carries a `reason`
+naming the cause and the two things that do work — `estimate="count"`,
+or `native=false` to plan through DuckDB.
+
+`estimated_rows` appears **only when a real number was extracted** —
+never as a `null` or a `0`. A model reading `estimated_rows: 0`
+concludes the query is free.
 
 ### Credentials never reach the model
 

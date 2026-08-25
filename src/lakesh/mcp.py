@@ -265,6 +265,76 @@ def _paginate(sql: str, limit: int, offset: int) -> tuple[str, bool]:
     )
 
 
+# --------------------------------------------------------------------------
+# pre-flight estimates
+#
+# What can honestly be produced differs per source, and the differences
+# are not small:
+#
+#   * DuckDB: `EXPLAIN (FORMAT json)` carries an optimizer cardinality on
+#     the root node. No byte figure anywhere in the plan.
+#   * Postgres over ADBC: no plan at all. The driver wraps every
+#     statement in `COPY (…) TO STDOUT`, and Postgres rejects
+#     `COPY (EXPLAIN …)` outright. Same for SHOW and SET.
+#   * Snowflake over ADBC: `EXPLAIN USING JSON` returns a plan, but its
+#     shape is unverified here, so it is passed through verbatim rather
+#     than parsed into numbers we cannot vouch for.
+#
+# Hence the hard rule below: emit `estimated_rows` only when a number was
+# genuinely extracted. Never null, never zero, never a regex over a
+# box-drawing tree — a model that reads `estimated_rows: 0` concludes the
+# query is free.
+
+_ESTIMATE_MODES = ("plan", "count")
+
+_POSTGRES_NO_EXPLAIN = (
+    "the postgresql ADBC driver wraps every statement in COPY (...) TO "
+    "STDOUT, which rejects EXPLAIN. Re-run with estimate=\"count\" for an "
+    "exact count, or native=false to plan through DuckDB."
+)
+
+
+def _estimate_mode(estimate: bool | str) -> str | None:
+    """None when no estimate was asked for."""
+    if estimate is True:
+        return "plan"
+    if estimate is False or estimate is None:
+        return None
+    return str(estimate).lower()
+
+
+def _duckdb_cardinality(plan_rows: list[tuple]) -> int | None:
+    """Pull `Estimated Cardinality` off the root node of DuckDB's JSON
+    plan. Returns None rather than a guess if the shape has moved —
+    "Estimated Cardinality" is an unpinned DuckDB internal."""
+    for row in plan_rows:
+        for cell in row:
+            if not isinstance(cell, str) or "Estimated Cardinality" not in cell:
+                continue
+            try:
+                node = json.loads(cell)
+            except (TypeError, ValueError):
+                continue
+            # DuckDB emits the plan as a list holding the root node.
+            if isinstance(node, list):
+                node = node[0] if node else None
+            while isinstance(node, dict):
+                info = node.get("extra_info") or {}
+                value = info.get("Estimated Cardinality")
+                if value is not None:
+                    try:
+                        return int(str(value))
+                    except (TypeError, ValueError):
+                        return None
+                children = node.get("children") or []
+                node = children[0] if children else None
+    return None
+
+
+def _count_probe(sql: str) -> str:
+    return f"SELECT count(*) AS n FROM ({sql}) AS _lakesh_est"
+
+
 def _native(con: duckdb.DuckDBPyConnection, handle: int, sql: str) -> tuple[list[str], list[tuple]]:
     cur = adbc_native_scan(con, handle, sql)
     columns = [d[0] for d in cur.description] if cur.description else []
@@ -804,6 +874,86 @@ def search_objects(
     return json.dumps(out, default=str)
 
 
+def _estimate_query(
+    profile_name: str | None, prof: Profile, sql: str, mode: str,
+    want: str, timeout: float | None,
+) -> str:
+    """Size a statement up without running it (or, for `count`, without
+    returning its rows)."""
+    out: dict[str, Any] = {"estimate": True, "mode": mode}
+    native = mode == "native"
+
+    if want == "count":
+        probe = _count_probe(sql)
+        try:
+            if native:
+                with _open_native(profile_name, timeout) as (con, handle, _p):
+                    with deadline(con, timeout):
+                        rows = adbc_native_scan(con, handle, probe).fetchall()
+            else:
+                with _open(profile_name) as (con, _catalog):
+                    with deadline(con, timeout):
+                        rows = con.execute(probe).fetchall()
+        except QueryTimeout as e:
+            return json.dumps({
+                "error": scrub(str(e), _KNOWN_SECRETS), "error_type": "timeout",
+                "timeout_s": e.seconds, "elapsed_s": round(e.elapsed, 1),
+                "enforced": "hard" if e.hard else "best_effort", "mode": mode,
+            })
+        except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+            return _error(e)
+        out["method"] = "count"
+        out["exact_rows"] = _jsonable(rows[0][0]) if rows and rows[0] else None
+        out["note"] = ("exact, but the scan ran on the source — this was not "
+                       "free on a metered warehouse")
+        return json.dumps(out, default=str)
+
+    # want == "plan"
+    driver = (prof.driver or "").lower()
+    if native and "postgres" in driver:
+        # Not a failure to route around silently: the routing advice is
+        # the entire value of the answer on this source.
+        out["method"] = "unavailable"
+        out["reason"] = _POSTGRES_NO_EXPLAIN
+        return json.dumps(out)
+
+    explain = f"EXPLAIN USING JSON {sql}" if native else f"EXPLAIN (FORMAT json) {sql}"
+    try:
+        if native:
+            with _open_native(profile_name, timeout) as (con, handle, _p):
+                with deadline(con, timeout):
+                    rows = adbc_native_scan(con, handle, explain).fetchall()
+        else:
+            with _open(profile_name) as (con, _catalog):
+                with deadline(con, timeout):
+                    rows = con.execute(explain).fetchall()
+    except QueryTimeout as e:
+        return json.dumps({
+            "error": scrub(str(e), _KNOWN_SECRETS), "error_type": "timeout",
+            "timeout_s": e.seconds, "elapsed_s": round(e.elapsed, 1),
+            "enforced": "hard" if e.hard else "best_effort", "mode": mode,
+        })
+    except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+        out["method"] = "unavailable"
+        out["reason"] = scrub(str(e), _KNOWN_SECRETS)
+        out["hint"] = ("this source could not produce a plan. Try "
+                       "estimate=\"count\" for an exact count.")
+        return json.dumps(out)
+
+    out["method"] = "explain"
+    out["plan"] = "\n".join(
+        str(cell) for row in rows for cell in row if cell is not None
+    )
+    if not native:
+        # Parsed only where the shape is known and tested. Snowflake's
+        # plan is passed through verbatim rather than guessed at.
+        rows_estimate = _duckdb_cardinality(rows)
+        if rows_estimate is not None:
+            out["estimated_rows"] = rows_estimate
+            out["note"] = "optimizer estimate, not a count"
+    return json.dumps(out, default=str)
+
+
 @server.tool()
 def query(
     sql: str,
@@ -813,6 +963,7 @@ def query(
     format: str = "json",
     native: bool | None = None,
     timeout_s: float | None = None,
+    estimate: bool | str = False,
 ) -> str:
     """Run a SQL statement and return its result.
 
@@ -859,6 +1010,18 @@ def query(
                 Postgres that lands at roughly 2x the requested seconds,
                 because the driver applies it once on prepare and once on
                 fetch.
+        estimate: size the query up INSTEAD of running it — worth doing
+                before an expensive one, since on a warehouse execution
+                is money. `true` asks the planner: an `estimated_rows`
+                figure where one can be had, and the plan verbatim.
+                `"count"` instead runs `count(*)` over the statement,
+                which is exact but does execute the scan server-side, so
+                it is opt-in rather than a silent fallback.
+                Not every source can answer: the Postgres ADBC driver
+                cannot EXPLAIN at all, and says so with a `reason`
+                telling you what to try instead. `estimated_rows` is
+                present only when a real number was extracted — never as
+                a null or a zero.
 
     Writes (INSERT / UPDATE / DELETE / DDL / DROP) are rejected unless
     the server was started with `LAKESH_MCP_WRITE=1` in its environment.
@@ -908,6 +1071,20 @@ def query(
 
     mode = "native" if use_native else "duckdb"
     timeout = _effective_timeout(prof, timeout_s)
+
+    want_estimate = _estimate_mode(estimate)
+    if want_estimate is not None:
+        if want_estimate not in _ESTIMATE_MODES:
+            return json.dumps({
+                "error": f"unknown estimate {estimate!r} (expected: true for a "
+                         f"planner estimate, or \"count\" for an exact count)",
+            })
+        if offset:
+            return json.dumps({
+                "error": "estimate and offset are mutually exclusive — an "
+                         "estimate describes the whole statement, not a page.",
+            })
+        return _estimate_query(profile, prof, sql, mode, want_estimate, timeout)
     # A hard deadline needs DuckDB to be the one blocked. In native mode
     # the statement sits inside the driver, which does not observe the
     # interrupt until it returns.
