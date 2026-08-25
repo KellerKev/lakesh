@@ -26,7 +26,19 @@ dependencies = [
     "rich>=13,<15",
     "prompt-toolkit>=3.0,<4",
     "httpx>=0.27,<1",
-    "mcp>=1.0",                 # FastMCP server (stdio) — `lakesh mcp` entry
+    # FastMCP server (stdio) — `lakesh mcp` entry. The <2 ceiling is load
+    # bearing: MCP SDK 2.0 moved FastMCP out of the SDK and deleted
+    # `mcp.server.fastmcp`, so an unpinned install resolves 2.x and
+    # `lakesh mcp` dies on import. An MCP client shows that only as a
+    # session with no lakesh tools — no error the user ever sees.
+    # Lifting the ceiling means porting mcp.py to the 2.x MCPServer API.
+    "mcp>=1.0,<2",
+    # DuckDB defers to pytz when converting TIMESTAMP WITH TIME ZONE into
+    # Python (it hands back pytz.tzfile tzinfo objects) but declares no
+    # dependency on it. Without pytz anything tz-aware raises "Required
+    # module 'pytz' failed to import" — including Snowflake's SHOW
+    # DATABASES and most of ACCOUNT_USAGE.
+    "pytz",
     # tomllib is stdlib on 3.11+; no extra dep needed.
 ]
 
