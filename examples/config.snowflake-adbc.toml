@@ -1,0 +1,106 @@
+# Example lakesh config: querying Snowflake through ADBC.
+#
+# Setup:
+#   1. Install the driver (it ships the shared library):
+#          pip install adbc-driver-snowflake
+#      then find the .so:
+#          python -c "import adbc_driver_snowflake as m, pathlib; \
+#                     print(*pathlib.Path(m.__file__).parent.glob('libadbc*'))"
+#   2. Put the DSN in the environment (keeps the PAT out of the file):
+#          export LAKESH_SNOWFLAKE_DSN='USER:PAT@MYORG-ACCOUNT'
+#   3. Copy this file:  cp examples/config.snowflake-adbc.toml \
+#                          ~/.config/lakesh/config.toml
+#   4. Check it:        lakesh doctor -p snowflake
+#   5. Query:           lakesh exec -p snowflake --native -q 'SHOW DATABASES'
+
+default = "snowflake"
+
+[profiles.snowflake]
+type      = "adbc"
+driver    = "/path/to/site-packages/adbc_driver_snowflake/libadbc_driver_snowflake.so"
+uri_env   = "LAKESH_SNOWFLAKE_DSN"   # "USER:PAT@ACCOUNT" — see below
+catalog   = "snow"                   # tables appear as snow.<schema>.<table>
+read_only = true                     # refuses writes even with LAKESH_MCP_WRITE=1
+
+[profiles.snowflake.options]
+"adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"   # required — see below
+"adbc.snowflake.sql.warehouse" = "MY_WH"
+"adbc.snowflake.sql.role"      = "MY_ROLE"
+"adbc.snowflake.sql.db"        = "SNOWFLAKE"       # scopes native introspection
+
+
+# ---------------------------------------------------------------------------
+# Why this shape
+#
+# The split — credentials in the DSN, connection settings in [options] —
+# is not a style choice. The drivers force it, and each half fails with
+# a different opaque numeric code if you get it wrong.
+#
+# * Credentials MUST be in the URI. `adbc_scanner` hands the ATTACH path
+#   to the driver as its `uri`, and the Snowflake driver parses it as a
+#   gosnowflake DSN. That parse *overwrites* user and password, so
+#   `username` / `password` are silently discarded whether you set them
+#   in a DuckDB SECRET or inline on the ATTACH. Symptom: `260001: user
+#   is empty` or `260002: password is empty` with both plainly set.
+#
+# * The account is the mirror image: read ONLY from
+#   `adbc.snowflake.sql.account`. Omit it and you get `260000: account
+#   is empty` no matter what the DSN says.
+#
+# * Keep the DSN path-free. `ACCOUNT/DB/SCHEMA?warehouse=…` breaks
+#   account parsing entirely. `USER:PAT@ACCOUNT` and nothing more.
+#
+# A Snowflake PAT goes in the password position. `auth_type = "auth_pat"`
+# also works but still requires the token in `password`, so it buys
+# nothing.
+#
+# The login name is frequently an email address, so the DSN has two `@`
+# signs — `first.last@corp.com:PAT@MYORG-ACCOUNT`. That is correct and
+# parses fine; the userinfo/host boundary is the last `@`.
+
+
+# ---------------------------------------------------------------------------
+# Native mode, and why it is the default here
+#
+# For adbc profiles lakesh sends SQL straight to the source rather than
+# through DuckDB's attached catalog. `lakesh exec --native`, and the
+# default for the MCP `query` tool (override with `native=false`).
+#
+# Reading through the ATTACH means DuckDB parses the SQL and the
+# extension translates scans into ADBC calls, which inherits that
+# layer's limits. Against Snowflake specifically:
+#
+#   * `SELECT count(*)` naming no column picks an arbitrary column and
+#     fails to cast it.
+#   * A second database is invisible — one ATTACH is one database.
+#   * `SHOW`, `QUALIFY`, `LATERAL FLATTEN` never arrive: DuckDB parses
+#     first and doesn't know the dialect.
+#   * Catalog population is eager and serial — one `DESC TABLE` per
+#     object. Every Snowflake database carries ~60-70 INFORMATION_SCHEMA
+#     views, so the floor is fixed regardless of data size, and
+#     introspection through the ATTACH runs to minutes. Measured against
+#     a live account: `list_tables` >240s attached vs ~5s native.
+#
+# What you give up in native mode is the cross-source join — you cannot
+# join Snowflake against a local Parquet file in one statement. When you
+# want that, ask for the DuckDB path explicitly:
+#
+#     lakesh exec -p snowflake -q '
+#       SELECT * FROM snow.PUBLIC.ORDERS o
+#       JOIN read_parquet(''local.parquet'') l USING (order_id)'
+
+
+# ---------------------------------------------------------------------------
+# A second profile against the same account, scoped to a different
+# database — switch with `lakesh -p analytics`.
+
+# [profiles.analytics]
+# type    = "adbc"
+# driver  = "/path/to/libadbc_driver_snowflake.so"
+# uri_env = "LAKESH_SNOWFLAKE_DSN"
+# catalog = "analytics"
+#
+# [profiles.analytics.options]
+# "adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"
+# "adbc.snowflake.sql.warehouse" = "MY_WH"
+# "adbc.snowflake.sql.db"        = "ANALYTICS"

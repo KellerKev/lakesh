@@ -74,10 +74,33 @@ path_style = true
 # catalog   = "pg"            # tables appear as pg.<schema>.<table>
 # read_only = true
 
+# --- ADBC: Snowflake with a PAT ------------------------------------------
+# Credentials go in the DSN (`USER:PAT@ACCOUNT`, path-free) and the
+# account goes in [options] — the Snowflake driver reads each from
+# exactly one place and ignores the other. Full explanation of why, plus
+# the numeric error codes you get when it's wrong, in
+# examples/config.snowflake-adbc.toml.
+
+# [profiles.snowflake]
+# type      = "adbc"
+# driver    = "/path/to/libadbc_driver_snowflake.so"  # pip install adbc-driver-snowflake
+# uri_env   = "LAKESH_SNOWFLAKE_DSN"                  # "USER:PAT@MYORG-ACCOUNT"
+# catalog   = "snow"
+# read_only = true
+#
+# [profiles.snowflake.options]
+# "adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"    # required — DSN is ignored for this
+# "adbc.snowflake.sql.warehouse" = "MY_WH"
+# "adbc.snowflake.sql.db"        = "SNOWFLAKE"
+
 # --- ADBC + OAuth2 device-code login (e.g. Snowflake via an IdP) ----------
 # Run `lakesh auth login -p snow` once; tokens are cached + refreshed in
 # $XDG_STATE_HOME/lakesh/tokens.json. Grants: client_credentials |
 # device_code | authorization_code (PKCE, opens your browser).
+#
+# Note there is no `username` option here: the Snowflake driver parses
+# the ATTACH path as a gosnowflake DSN and that parse overwrites user
+# and password, so a `username` option is silently discarded.
 
 # [profiles.snow]
 # type         = "adbc"
@@ -87,7 +110,6 @@ path_style = true
 #
 # [profiles.snow.options]
 # "adbc.snowflake.sql.account" = "myorg-account1"
-# username                     = "kevin"
 #
 # [profiles.snow.oauth]
 # grant                         = "device_code"

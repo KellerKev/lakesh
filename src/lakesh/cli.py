@@ -244,6 +244,45 @@ def mcp(
 # --------------------------------------------------------------------------
 # doctor — test connectivity against a profile
 
+def _adbc_hints(prof: Config | object, message: str) -> list[str]:
+    """Turn an opaque driver failure into something actionable.
+
+    The Snowflake driver reports auth problems as bare numeric codes,
+    and each one points at a different half of the DSN/options split
+    that its config shape requires (credentials in the DSN, account in
+    the options — see examples/config.snowflake-adbc.toml).
+    """
+    if getattr(prof, "type", None) != "adbc":
+        return []
+    msg = message.lower()
+    hints: list[str] = []
+    if "driver" in msg or "manifest" in msg or "no such file" in msg:
+        hints.append(
+            f"the ADBC driver {getattr(prof, 'driver', '')!r} may not be "
+            f"installed. Most drivers ship as a Python package that carries "
+            f"the shared library — e.g. `pip install adbc-driver-snowflake` "
+            f"or `pip install adbc-driver-postgresql` — and `driver` can "
+            f"point straight at that libadbc_driver_*.so. `dbc install "
+            f"<name>` works too if you have the driver manager CLI."
+        )
+    if "260000" in msg:
+        hints.append(
+            "Snowflake 260000 (account is empty): the account is read only "
+            'from the `adbc.snowflake.sql.account` option, never from the '
+            "DSN. Set it under [profiles.<name>.options]."
+        )
+    if "260001" in msg or "260002" in msg:
+        hints.append(
+            "Snowflake 260001/260002 (user/password is empty): the driver "
+            "parses the ATTACH path as a gosnowflake DSN and that parse "
+            "overwrites user and password, so `username`/`password` options "
+            "are discarded. Put them in the URI as USER:PAT@ACCOUNT — and "
+            "keep it path-free, since a trailing /DB/SCHEMA breaks account "
+            "parsing."
+        )
+    return hints
+
+
 @app.command()
 def doctor(
     profile: Optional[str] = typer.Option(None, "-p", "--profile"),
@@ -330,12 +369,8 @@ def doctor(
     except Exception as e:
         text = scrub(str(e), secrets)
         console.print(f"[red]✗ attach + list: {text}[/red]")
-        msg = text.lower()
-        if prof.type == "adbc" and ("driver" in msg or "manifest" in msg):
-            console.print(
-                f"  [yellow]hint:[/yellow] the ADBC driver {prof.driver!r} may "
-                f"not be installed — try: dbc install {prof.driver}"
-            )
+        for hint in _adbc_hints(prof, text):
+            console.print(f"  [yellow]hint:[/yellow] {hint}")
         ok = False
 
     if not ok:

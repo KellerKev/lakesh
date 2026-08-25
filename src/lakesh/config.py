@@ -461,7 +461,26 @@ path_style = true
 # catalog = "pg"            # tables appear as pg.<schema>.<table>
 # read_only = true
 
+# --- ADBC: Snowflake with a PAT ------------------------------------------
+# Credentials go in the DSN, the account goes in [options]. The driver
+# reads each from exactly one place and ignores the other; see
+# examples/config.snowflake-adbc.toml for the why and the error codes.
+# [profiles.snowflake]
+# type      = "adbc"
+# driver    = "/path/to/libadbc_driver_snowflake.so"  # pip install adbc-driver-snowflake
+# uri_env   = "LAKESH_SNOWFLAKE_DSN"                  # "USER:PAT@MYORG-ACCOUNT"
+# catalog   = "snow"
+# read_only = true
+#
+# [profiles.snowflake.options]
+# "adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"    # required
+# "adbc.snowflake.sql.warehouse" = "MY_WH"
+# "adbc.snowflake.sql.db"        = "SNOWFLAKE"
+
 # --- ADBC + OAuth2 device-code login (e.g. Snowflake via an IdP) ----------
+# No `username` option: the Snowflake driver parses the ATTACH path as a
+# gosnowflake DSN and that parse overwrites user and password, so a
+# `username` option is silently discarded.
 # [profiles.snow]
 # type         = "adbc"
 # driver       = "snowflake"
@@ -470,7 +489,6 @@ path_style = true
 #
 # [profiles.snow.options]
 # "adbc.snowflake.sql.account" = "myorg-account1"
-# username                     = "kevin"
 #
 # [profiles.snow.oauth]
 # grant                         = "device_code"

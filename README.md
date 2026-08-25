@@ -256,11 +256,92 @@ Driver quirks worth knowing (verified against a live Postgres):
   # or:  uri_env = "LAKESH_PG_DSN"   (literal `uri` wins if both are set)
   ```
 
-- Upstream `adbc_scanner` bug: `GROUP BY` / `DISTINCT` on **short
-  (≤12-byte) VARCHAR columns** read through an attached catalog can
-  return corrupted group keys. Longer strings, joins, filters, plain
-  scans, and the raw `adbc_scan()` function are unaffected. Workaround
-  until fixed upstream: force a copy, e.g. `GROUP BY kind || ''`.
+- **`SELECT count(*)` naming no column fails** through an attached
+  catalog: the extension picks an arbitrary column and fails to cast it
+  (`Could not convert string '<uuid>' to INT64` on Postgres,
+  `Unimplemented type for cast (TIMESTAMP WITH TIME ZONE -> BIGINT)` on
+  Snowflake). Name a column — `count(id)` — or use native mode.
+
+- **Upstream `adbc_scanner` bug — silently wrong data.** `GROUP BY` /
+  `DISTINCT` on a **VARCHAR column** read through an attached catalog
+  can return corrupted group keys: the values come back as single
+  garbage characters and distinct groups collapse into one, with no
+  error. Reproduced on a plain local Postgres table, so it is not
+  specific to any one source. Plain scans of the same table return
+  correct values, and the raw `adbc_scan()` function (i.e. native mode)
+  is unaffected. Not fixable in lakesh. Workarounds: prefer `--native`,
+  or force a copy with `GROUP BY kind || ''`. **Sanity-check aggregate
+  results against the source before trusting them.**
+
+### Native passthrough — `--native`
+
+For `adbc` profiles, `lakesh exec --native` sends your SQL straight to
+the source in the source's own dialect, bypassing DuckDB's attached
+catalog entirely:
+
+```bash
+lakesh exec -p snowflake --native -q 'SHOW DATABASES'
+lakesh exec -p snowflake --native -q "
+  SELECT warehouse_name, ROUND(SUM(credits_used),2) c
+  FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+  WHERE start_time > DATEADD(day,-7,CURRENT_TIMESTAMP())
+  GROUP BY 1 ORDER BY c DESC LIMIT 5"
+```
+
+Reach for it when the attached-catalog path can't express what you
+need — `SHOW`, `QUALIFY`, `LATERAL FLATTEN`, a bare `count(*)`, a second
+database — or when it's simply too slow. Catalog population through the
+ATTACH is eager and serial (one `DESC TABLE` per object, nothing cached
+between connections), so against a remote source the cost is round-trip
+latency × object count. Measured against a live Snowflake account,
+listing tables took **>240s attached vs ~5s native**.
+
+What you give up is the cross-source join: native mode talks to one
+source, so joining it against a local Parquet file needs the DuckDB
+path. Credentials are still never inlined — `adbc_connect()` takes every
+option value as a bound parameter.
+
+The MCP `query` tool defaults to native for adbc profiles and reports
+which mode ran; pass `native=false` to force DuckDB.
+
+### Snowflake profile
+
+```toml
+[profiles.snowflake]
+type      = "adbc"
+driver    = "/path/to/libadbc_driver_snowflake.so"  # pip install adbc-driver-snowflake
+uri_env   = "LAKESH_SNOWFLAKE_DSN"                  # "USER:PAT@MYORG-ACCOUNT"
+catalog   = "snow"
+read_only = true
+
+[profiles.snowflake.options]
+"adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"    # required
+"adbc.snowflake.sql.warehouse" = "MY_WH"
+"adbc.snowflake.sql.db"        = "SNOWFLAKE"
+```
+
+The split is forced by the driver, and each half fails with its own
+opaque numeric code:
+
+- **Credentials must be in the DSN.** `adbc_scanner` hands the ATTACH
+  path to the driver as its `uri`, and the Snowflake driver parses it as
+  a gosnowflake DSN — a parse that *overwrites* user and password. So
+  `username` / `password` options are silently discarded. Symptom:
+  `260001: user is empty` or `260002: password is empty` with both
+  plainly set.
+- **The account must be in `[options]`**, read only from
+  `adbc.snowflake.sql.account`. Omit it and you get `260000: account is
+  empty` regardless of the DSN.
+- **Keep the DSN path-free.** `ACCOUNT/DB/SCHEMA?warehouse=…` breaks
+  account parsing entirely.
+
+A PAT goes in the password position. Snowflake login names are often
+email addresses, so the DSN has two `@` signs
+(`first.last@corp.com:PAT@MYORG-ACCOUNT`) — that's correct, the
+userinfo/host boundary is the last one.
+
+Full annotated example:
+[`examples/config.snowflake-adbc.toml`](examples/config.snowflake-adbc.toml).
 
 ### OAuth2 per data source
 
@@ -372,7 +453,10 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `list_namespaces(profile=None)` | List schemas in a profile's catalog |
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
 | `describe_table(namespace, table, profile=None)` | Columns + types + nullability |
-| `query(sql, profile=None, limit=1000, format="json")` | Run SQL and return results |
+| `query(sql, profile=None, limit=1000, format="json", native=None)` | Run SQL and return results |
+
+`lakesh mcp -c <path>` points the server at a specific config; so does
+`$LAKESH_CONFIG`.
 
 ### Read-only by default
 
@@ -381,6 +465,43 @@ Continue, …) to spawn it, and the LLM gets these tools:
 Set `LAKESH_MCP_WRITE=1` in the server's environment to enable
 INSERT / UPDATE / DELETE / DDL / `CALL ducklake_…` procedures. Keeps
 LLM-driven SQL safe by default.
+
+A profile with `read_only = true` refuses writes **even with
+`LAKESH_MCP_WRITE=1`** — the profile is the more specific statement of
+intent, and native passthrough opens its own ADBC connection that the
+ATTACH's `READ_ONLY` flag never sees.
+
+### Credentials never reach the model
+
+For Snowflake and Postgres profiles the connection URI *is* the
+credential, and `list_profiles` output goes straight into an LLM's
+context. So `list_profiles` reports a redacted URI (username and host
+kept, password masked), and every tool's error payload is scrubbed of
+known secret values before it leaves — driver errors like to quote the
+failing statement with the DSN inline. `lakesh config show` and
+`lakesh profiles show` redact the same way.
+
+### Native passthrough for ADBC profiles
+
+`query` and the three introspection tools send SQL to the source
+directly for `adbc` profiles. Without it, `list_tables` and
+`describe_table` against a remote source run past any MCP client's
+timeout — the client reports `MCP error -32001: Request timed out`,
+which reads like a dead server rather than a slow query. See
+[Native passthrough](#native-passthrough----native) for the mechanics.
+
+Two consequences worth knowing when reading tool output:
+
+- Column types come back in the source's vocabulary (`TEXT`, `NUMBER`)
+  rather than DuckDB's (`VARCHAR`, `BIGINT`) — which is the vocabulary
+  you want when writing SQL for that source.
+- `describe_table`'s `namespace` is the bare schema (`ACCOUNT_USAGE`),
+  not `DATABASE.SCHEMA`; the connection is already scoped to one
+  database via `adbc.snowflake.sql.db`.
+
+`query` reports `"mode": "native" | "duckdb"` so you can confirm which
+path ran, and accepts `native=false` to force DuckDB — the only way to
+join a source against a local Parquet file in one statement.
 
 ### Claude Desktop config example
 
