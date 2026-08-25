@@ -192,3 +192,187 @@ token_endpoint                = "https://idp.invalid/token"
     out = json.loads(lakesh_mcp.query("SELECT 1"))
     assert "error" in out
     assert "lakesh auth login -p snow" in out["error"]
+
+
+# --------------------------------------------------------------------------
+# native passthrough for adbc profiles
+#
+# These use a fake connection rather than a live source: what needs
+# pinning is *which statement lakesh sends*, not what a driver does with
+# it. The behaviour they protect (introspection through the source
+# instead of DuckDB's catalog) is a 240s-timeout-vs-6s difference
+# against a remote account, so a silent regression is expensive.
+
+
+class _FakeCursor:
+    def __init__(self, columns, rows):
+        self.description = [(c,) for c in columns] if columns else None
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def fetchmany(self, n):
+        return list(self._rows)[:n]
+
+
+class _FakeNativeConnection:
+    """Records every statement handed to adbc_scan()."""
+
+    # The default row is wide enough for the widest introspection shape
+    # (describe_table's four columns); narrower callers just index less.
+    def __init__(self, columns=("a", "b", "c", "d"), rows=(("v", "w", "YES", 1),)):
+        self.statements: list[str] = []
+        self._columns, self._rows = list(columns), list(rows)
+
+    def execute(self, sql, params=None):
+        if "adbc_scan" in sql:
+            self.statements.append(params[1])
+            return _FakeCursor(self._columns, self._rows)
+        raise AssertionError(f"unexpected statement on the native path: {sql}")
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def adbc_config(tmp_path: Path, monkeypatch) -> Path:
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "snow"
+
+[profiles.snow]
+type    = "adbc"
+driver  = "/x/libadbc_driver_snowflake.so"
+uri     = "user:pw-not-real-just-long@ACCOUNT"
+catalog = "snow"
+
+[profiles.lake]
+type         = "ducklake"
+postgres_dsn = "dbname=lake host=/tmp"
+data_path    = "s3://b/p/"
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    return p
+
+
+@pytest.fixture
+def fake_native(monkeypatch):
+    con = _FakeNativeConnection()
+    monkeypatch.setattr(
+        lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1234)
+    )
+    return con
+
+
+def test_prefer_native_only_for_adbc(adbc_config):
+    cfg = lakesh_mcp._load_or_raise()
+    assert lakesh_mcp._prefer_native(cfg.get("snow")) is True
+    assert lakesh_mcp._prefer_native(cfg.get("lake")) is False
+
+
+def test_query_defaults_to_native_for_adbc(adbc_config, fake_native):
+    out = json.loads(lakesh_mcp.query("SHOW DATABASES"))
+    assert out["mode"] == "native"
+    # Sent verbatim — DuckDB never parses it, which is the whole point:
+    # SHOW / QUALIFY / cross-database references can't survive the
+    # attached-catalog path.
+    assert fake_native.statements == ["SHOW DATABASES"]
+
+
+def test_query_native_false_goes_back_through_duckdb(adbc_config, fake_native):
+    """`native=false` is the only way to join a source against a local
+    Parquet file in one statement, so it has to keep working."""
+    out = json.loads(lakesh_mcp.query("SELECT 1", native=False))
+    # No live driver here, so this fails at ATTACH — the point is that it
+    # took the DuckDB path at all rather than adbc_scan.
+    assert fake_native.statements == []
+    assert "mode" not in out or out["mode"] == "duckdb"
+
+
+def test_introspection_goes_to_the_source_for_adbc(adbc_config, fake_native):
+    lakesh_mcp.list_namespaces()
+    lakesh_mcp.list_tables(namespace="ACCOUNT_USAGE")
+    lakesh_mcp.describe_table("ACCOUNT_USAGE", "WAREHOUSE_METERING_HISTORY")
+
+    assert len(fake_native.statements) == 3
+    schemata, tables, columns = fake_native.statements
+    assert "information_schema.schemata" in schemata
+    assert "information_schema.tables" in tables
+    assert "'ACCOUNT_USAGE'" in tables
+    assert "information_schema.columns" in columns
+    assert "'WAREHOUSE_METERING_HISTORY'" in columns
+    # No table_catalog predicate: the native connection is already scoped
+    # to one database, and DuckDB's catalog alias is meaningless there.
+    assert "table_catalog" not in tables
+
+
+def test_native_introspection_escapes_interpolated_values(adbc_config, fake_native):
+    """adbc_scan takes the statement as a string, so values coming from
+    the model are escaped rather than bound. Verify the escaping."""
+    lakesh_mcp.list_tables(namespace="it's")
+    assert "'it''s'" in fake_native.statements[0]
+
+
+def test_read_only_profile_beats_write_env(tmp_path: Path, monkeypatch):
+    """Native passthrough opens its own ADBC connection, which the
+    ATTACH's READ_ONLY flag never sees — so the tool has to enforce it,
+    and the profile is the more specific statement of intent."""
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "ro"
+
+[profiles.ro]
+type      = "adbc"
+driver    = "/x/driver.so"
+uri       = "user@ACCOUNT"
+read_only = true
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    monkeypatch.setenv("LAKESH_MCP_WRITE", "1")
+
+    out = json.loads(lakesh_mcp.query("DROP TABLE t"))
+    assert "read_only" in out["error"]
+    assert "LAKESH_MCP_WRITE does not override" in out["error"]
+
+
+# --------------------------------------------------------------------------
+# JSON coercion of source-native types
+
+
+def test_jsonable_coerces_decimal_and_temporals():
+    import datetime as dt
+    import decimal
+    import uuid
+
+    j = lakesh_mcp._jsonable
+    assert j(decimal.Decimal("170.54")) == pytest.approx(170.54)
+    assert j(dt.date(2026, 1, 2)) == "2026-01-02"
+    assert j(uuid.UUID("14c62ee3-390d-4b29-9dc2-c595593faa39")).startswith("14c62ee3")
+    assert j(b"\x00\xff") == "00ff"
+
+
+def test_integral_decimal_becomes_int_not_float():
+    """A NUMBER(38,0) key is exactly what an agent joins on, and float
+    silently rounds it past 2^53."""
+    import decimal
+
+    big = decimal.Decimal("12345678901234567890")
+    out = lakesh_mcp._jsonable(big)
+    assert isinstance(out, int)
+    assert out == 12345678901234567890
+
+
+def test_query_serializes_decimal_rows(adbc_config, monkeypatch):
+    """Snowflake returns Decimal for every NUMBER column; without
+    coercion the whole tool call aborts with "Object of type Decimal is
+    not JSON serializable"."""
+    import decimal
+
+    con = _FakeNativeConnection(
+        columns=("warehouse_name", "credits"),
+        rows=[("ANALYTICS_WH", decimal.Decimal("170.54"))],
+    )
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    out = json.loads(lakesh_mcp.query("SELECT warehouse_name, credits FROM x"))
+    assert out["rows"] == [{"warehouse_name": "ANALYTICS_WH", "credits": 170.54}]
