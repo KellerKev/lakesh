@@ -768,3 +768,43 @@ uri    = "postgresql://u@h/db"
     assert prof.status == "unknown"
     assert prof.max_staleness_seconds is None
     assert prof.annotation_for("public", "orders") is None
+
+
+def test_describe_table_shape_defaults_to_object(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+"""))
+    assert cfg.describe_table_shape == "object"
+
+
+def test_describe_table_shape_parses(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+default = "pg"
+describe_table_shape = "array"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+"""))
+    assert cfg.describe_table_shape == "array"
+
+
+def test_describe_table_shape_rejects_unknown(tmp_path):
+    p = _write(tmp_path, """
+default = "pg"
+describe_table_shape = "tuple"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+""")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "tuple" in str(e.value) and "object, array" in str(e.value)

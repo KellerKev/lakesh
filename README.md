@@ -453,7 +453,7 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `search_objects(pattern, profile=None, namespace=None, match="all", limit=200, all_profiles=False)` | **Find** a schema, table or column by name |
 | `list_namespaces(profile=None)` | List schemas in a profile's catalog |
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
-| `describe_table(namespace, table, profile=None)` | Columns, plus whether this is the table to use |
+| `describe_table(namespace, table, profile=None, shape=None)` | Columns, plus whether this is the table to use |
 | `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None, estimate=False)` | Run SQL and return results |
 
 ### Finding things — `search_objects`
@@ -666,6 +666,30 @@ describe_table("ANALYTICS", "FCT_REVENUE")
 Fields are **omitted when there is nothing to say**, so a catalog with no
 annotations against a source with no timestamps produces the same output
 it always did.
+
+#### The `describe_table` envelope is opt-out
+
+That envelope is a change of shape: `describe_table` used to return a
+bare array of columns. The envelope is the better default, because it is
+the one place an agent can be told a table is deprecated *before* it
+builds a query on it — but if something already parses the array, keep
+it:
+
+```toml
+describe_table_shape = "array"   # top level, not inside a profile
+```
+
+or `LAKESH_MCP_DESCRIBE_SHAPE=array` in the server's environment, or per
+call with `describe_table(..., shape="array")`.
+
+Precedence is **call → environment → config file**. Unlike the query
+deadline, where a profile's `query_timeout_s` is a ceiling because it is
+a safety property, this is a presentation preference, so the caller that
+knows what it parses gets the last word.
+
+The trade is explicit: a bare array has nowhere to report `status`,
+`superseded_by` or `freshness`, so you lose the deprecation warning. In
+exchange lakesh skips the extra round trip that would have fetched them.
 
 #### Which sources can actually report freshness
 

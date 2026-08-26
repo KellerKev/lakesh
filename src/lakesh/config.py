@@ -131,6 +131,12 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 TABLE_STATUSES = ("canonical", "deprecated", "unknown")
 
+# `describe_table` output shapes. `object` carries the columns in an
+# envelope alongside the table's status and freshness; `array` is the
+# original bare list of columns, kept because it is the shape anything
+# written before those existed will be parsing.
+DESCRIBE_TABLE_SHAPES = ("object", "array")
+
 _ANNOTATION_KEYS = frozenset({"status", "max_staleness", "note", "superseded_by"})
 
 _DURATION_RE = re.compile(r"(\d+)\s*([smhdw])", re.IGNORECASE)
@@ -337,6 +343,14 @@ class Config:
     profiles: dict[str, Profile]
     default: str | None = None
     source_path: Path | None = None
+    describe_table_shape: str = "object"
+    """Output shape for the MCP `describe_table` tool.
+
+    `object` wraps the columns in an envelope that can also carry the
+    table's status and freshness. `array` is the older bare list of
+    columns — no envelope, and therefore nowhere to report that a table
+    is deprecated. Set it when a client parses the array shape and you
+    would rather not change the client."""
 
     def get(self, name: str | None) -> Profile:
         name = name or self.default
@@ -578,7 +592,17 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError(
             f"{path}: `default = {default!r}` but no such profile"
         )
-    return Config(profiles=profiles, default=default, source_path=path)
+    shape = str(data.get("describe_table_shape", "object"))
+    if shape not in DESCRIBE_TABLE_SHAPES:
+        raise ConfigError(
+            f"{path}: unknown describe_table_shape {shape!r} "
+            f"(supported: {', '.join(DESCRIBE_TABLE_SHAPES)})"
+        )
+
+    return Config(
+        profiles=profiles, default=default, source_path=path,
+        describe_table_shape=shape,
+    )
 
 
 def write_example_config(path: Path) -> None:
@@ -593,6 +617,13 @@ _EXAMPLE = """\
 # `default` below.
 
 default = "local"
+
+# Output shape for the MCP `describe_table` tool: "object" (default)
+# wraps the columns alongside the table's status and freshness; "array"
+# is the older bare list of columns, for clients that already parse it.
+# A bare array has nowhere to report that a table is deprecated.
+# describe_table_shape = "array"
+
 
 # --- Iceberg REST profile (default) --------------------------------------
 

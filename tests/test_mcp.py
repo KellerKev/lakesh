@@ -858,3 +858,93 @@ def test_duckdb_cardinality_parses_a_real_plan():
 ])
 def test_duckdb_cardinality_returns_none_rather_than_guessing(plan):
     assert lakesh_mcp._duckdb_cardinality(plan) is None
+
+
+# --------------------------------------------------------------------------
+# describe_table output shape
+#
+# The envelope is the better default — it is the one place an agent can
+# be told a table is deprecated before it builds on it — but it broke a
+# shape that anything written earlier is parsing, so the old one stays
+# reachable.
+
+
+@pytest.fixture
+def shape_config(tmp_path: Path, monkeypatch) -> Path:
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "snow"
+describe_table_shape = "array"
+
+[profiles.snow]
+type    = "adbc"
+driver  = "/x/libadbc_driver_snowflake.so"
+uri     = "user:pw-not-real-just-long@ACCOUNT"
+catalog = "snow"
+
+[profiles.snow.tables]
+"S.T" = { status = "deprecated", superseded_by = "S.T2" }
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    monkeypatch.delenv("LAKESH_MCP_DESCRIBE_SHAPE", raising=False)
+    return p
+
+
+def test_describe_table_defaults_to_the_envelope(adbc_config, fake_native, monkeypatch):
+    monkeypatch.delenv("LAKESH_MCP_DESCRIBE_SHAPE", raising=False)
+    out = json.loads(lakesh_mcp.describe_table("S", "T"))
+    assert isinstance(out, dict)
+    assert out["namespace"] == "S" and out["table"] == "T"
+    assert isinstance(out["columns"], list)
+
+
+def test_describe_table_array_shape_is_the_old_bare_list(adbc_config, fake_native, monkeypatch):
+    monkeypatch.delenv("LAKESH_MCP_DESCRIBE_SHAPE", raising=False)
+    out = json.loads(lakesh_mcp.describe_table("S", "T", shape="array"))
+    assert isinstance(out, list)
+    assert set(out[0]) == {"column", "type", "nullable", "position"}
+
+
+def test_describe_table_shape_comes_from_config(shape_config, fake_native):
+    assert isinstance(json.loads(lakesh_mcp.describe_table("S", "T")), list)
+
+
+def test_describe_table_precedence_is_call_then_env_then_config(
+    shape_config, fake_native, monkeypatch
+):
+    """Unlike the query deadline — where the profile is a ceiling
+    because it is a safety property — this is a presentation preference,
+    so the caller that knows what it parses gets the last word."""
+    # config says array
+    assert isinstance(json.loads(lakesh_mcp.describe_table("S", "T")), list)
+    # env beats config
+    monkeypatch.setenv("LAKESH_MCP_DESCRIBE_SHAPE", "object")
+    assert isinstance(json.loads(lakesh_mcp.describe_table("S", "T")), dict)
+    # the call beats env
+    assert isinstance(
+        json.loads(lakesh_mcp.describe_table("S", "T", shape="array")), list)
+
+
+def test_array_shape_skips_the_freshness_round_trip(shape_config, fake_native):
+    """There is nowhere in a bare array to report status or freshness,
+    so don't pay a second statement to fetch them."""
+    lakesh_mcp.describe_table("S", "T")
+    assert len(fake_native.statements) == 1
+    assert "last_altered" not in fake_native.statements[0]
+
+    fake_native.statements.clear()
+    lakesh_mcp.describe_table("S", "T", shape="object")
+    assert len(fake_native.statements) == 2
+
+
+def test_array_shape_loses_the_deprecation_warning(shape_config, fake_native):
+    """Documented consequence, pinned so it stays a deliberate trade
+    rather than a surprise: S.T is marked deprecated in the fixture."""
+    assert "deprecated" in lakesh_mcp.describe_table("S", "T", shape="object")
+    assert "deprecated" not in lakesh_mcp.describe_table("S", "T", shape="array")
+
+
+def test_describe_table_rejects_an_unknown_shape(adbc_config, fake_native):
+    out = json.loads(lakesh_mcp.describe_table("S", "T", shape="bare"))
+    assert "unknown shape" in out["error"]
+    assert fake_native.statements == []

@@ -3,6 +3,13 @@
 
 default = "local"
 
+# Output shape for the MCP `describe_table` tool: "object" (default)
+# wraps the columns alongside the table's status and freshness; "array"
+# is the older bare list of columns, for clients that already parse it.
+# A bare array has nowhere to report that a table is deprecated.
+# describe_table_shape = "array"
+
+
 # --- Iceberg REST profile (most common) -----------------------------------
 
 [profiles.local]

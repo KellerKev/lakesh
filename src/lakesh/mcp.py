@@ -75,7 +75,14 @@ from typing import Any, Iterator
 import duckdb
 from mcp.server.fastmcp import FastMCP
 
-from .config import Config, ConfigError, Profile, default_config_path, load_config
+from .config import (
+    DESCRIBE_TABLE_SHAPES,
+    Config,
+    ConfigError,
+    Profile,
+    default_config_path,
+    load_config,
+)
 from .duck import (
     QueryTimeout,
     adbc_native_scan,
@@ -469,6 +476,22 @@ def _profile_of(profile: str | None) -> Profile:
     return _load_or_raise().get(profile)
 
 
+def _describe_shape(cfg: Config, requested: str | None) -> str:
+    """Resolve `describe_table`'s output shape.
+
+    Precedence is caller, then environment, then config file. Unlike the
+    query deadline — where the profile is a ceiling because it is a
+    safety property — this is a presentation preference, so the caller
+    who knows what it wants to parse gets the last word.
+    """
+    if requested:
+        return str(requested).lower()
+    env = os.environ.get("LAKESH_MCP_DESCRIBE_SHAPE")
+    if env:
+        return env.strip().lower()
+    return cfg.describe_table_shape
+
+
 @server.tool()
 def list_namespaces(profile: str | None = None) -> str:
     """List schemas / namespaces in the catalog. `profile` defaults to
@@ -553,7 +576,10 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
 
 
 @server.tool()
-def describe_table(namespace: str, table: str, profile: str | None = None) -> str:
+def describe_table(
+    namespace: str, table: str, profile: str | None = None,
+    shape: str | None = None,
+) -> str:
     """Describe one table: its columns, and whether it is the one you
     should be using.
 
@@ -563,6 +589,14 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
     `superseded_by`, and a `freshness` block. Check `status` before
     building a query on it — a deprecated table will still answer
     perfectly good SQL with the wrong numbers.
+
+    `shape="array"` returns just the bare list of columns instead, which
+    is what this tool returned before the envelope existed. It is there
+    for callers that already parse that shape; note that it has nowhere
+    to report that a table is deprecated or stale, so you lose the
+    warning. The default can be set once with `describe_table_shape` in
+    the config file or `LAKESH_MCP_DESCRIBE_SHAPE` in the server's
+    environment.
 
     `freshness.state` is one of `fresh`, `stale`, `unrated` (nobody set a
     threshold) or `unknown` (**the source cannot report a
@@ -577,8 +611,18 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
     """
     observed: tuple = ()
     try:
-        prof = _profile_of(profile)
+        cfg = _load_or_raise()
+        resolved_shape = _describe_shape(cfg, shape)
+        if resolved_shape not in DESCRIBE_TABLE_SHAPES:
+            return json.dumps({
+                "error": f"unknown shape {resolved_shape!r} "
+                         f"(supported: {', '.join(DESCRIBE_TABLE_SHAPES)})",
+            })
+        prof = cfg.get(profile)
         dialect = freshness.source_dialect(prof)
+        # In `array` shape there is nowhere to put status or freshness,
+        # so don't pay for the extra round trip that fetches them.
+        want_freshness = resolved_shape == "object"
         if _prefer_native(prof):
             with _open_native(profile) as (con, handle, _prof):
                 _cols, rows = _native(con, handle, (
@@ -591,7 +635,7 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
                 # A second statement, but on the already-open handle —
                 # one more round trip, not a reconnect, and nowhere near
                 # the eager-catalog path that cost minutes.
-                extra = freshness.listing_columns(dialect)
+                extra = freshness.listing_columns(dialect) if want_freshness else ""
                 if extra:
                     _c, found = _native(con, handle, (
                         f"SELECT {extra} FROM information_schema.tables t"
@@ -612,6 +656,14 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
         return _error(e)
 
+    columns = [
+        {"column": r[0], "type": r[1], "nullable": str(r[2]).upper() in ("YES", "TRUE"),
+         "position": int(r[3])}
+        for r in rows
+    ]
+    if resolved_shape == "array":
+        return json.dumps(columns, default=str)
+
     out: dict[str, Any] = {"namespace": namespace, "table": table}
     out.update(freshness.describe(
         prof, prof.annotation_for(namespace, table),
@@ -620,11 +672,7 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
         size_bytes=observed[2] if len(observed) > 2 else None,
         dialect=dialect,
     ))
-    out["columns"] = [
-        {"column": r[0], "type": r[1], "nullable": str(r[2]).upper() in ("YES", "TRUE"),
-         "position": int(r[3])}
-        for r in rows
-    ]
+    out["columns"] = columns
     return json.dumps(out, default=str)
 
 
