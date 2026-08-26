@@ -84,6 +84,7 @@ from .duck import (
     connect_native,
     deadline,
 )
+from . import freshness
 from .oauth import AuthRequired
 from .output import _stringify  # type: ignore[attr-defined]
 from .redact import profile_secrets, redact_uri, scrub
@@ -130,7 +131,10 @@ def _error(exc: Exception | str) -> str:
 # --------------------------------------------------------------------------
 # native passthrough helpers (see the module docstring)
 
-_SYSTEM_SCHEMAS = ("main", "information_schema", "pg_catalog")
+# `pg_toast` is owned by the connecting role on Postgres, so the source's
+# own information_schema lists it even though DuckDB's attached catalog
+# never did — noise an agent has to reason past for nothing.
+_SYSTEM_SCHEMAS = ("main", "information_schema", "pg_catalog", "pg_toast")
 
 
 def _prefer_native(profile: Profile) -> bool:
@@ -447,12 +451,17 @@ def list_profiles() -> str:
             )
         else:
             desc = f"DuckLake @ {p.data_path} (catalog={p.catalog})"
-        out.append({
+        entry = {
             "name": name,
             "type": p.type,
             "default": (name == cfg.default),
             "description": desc,
-        })
+        }
+        if p.status != "unknown":
+            entry["status"] = p.status
+        if p.max_staleness_seconds:
+            entry["max_staleness_seconds"] = p.max_staleness_seconds
+        out.append(entry)
     return json.dumps(out)
 
 
@@ -498,13 +507,20 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
     """
     try:
         prof = _profile_of(profile)
+        dialect = freshness.source_dialect(prof)
         if _prefer_native(prof):
+            # Freshness columns ride on the statement already being sent,
+            # so on Snowflake this costs zero extra round trips.
+            extra = freshness.listing_columns(dialect)
             sql = (
-                "SELECT table_schema, table_name FROM information_schema.tables "
-                f"WHERE {_not_system_schemas('table_schema')}"
+                "SELECT t.table_schema, t.table_name"
+                + (f", {extra}" if extra else "")
+                + " FROM information_schema.tables t"
+                + freshness.listing_join(dialect)
+                + f" WHERE {_not_system_schemas('t.table_schema')}"
             )
             if namespace:
-                sql += f" AND table_schema = {_lit(namespace)}"
+                sql += f" AND t.table_schema = {_lit(namespace)}"
             sql += " ORDER BY 1, 2"
             with _open_native(profile) as (con, handle, _prof):
                 _cols, rows = _native(con, handle, sql)
@@ -521,13 +537,37 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
                 rows = con.execute(q, params).fetchall()
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
         return _error(e)
-    return json.dumps([{"namespace": r[0], "table": r[1]} for r in rows])
+
+    out = []
+    for row in rows:
+        entry = {"namespace": row[0], "table": row[1]}
+        entry.update(freshness.describe(
+            prof, prof.annotation_for(row[0], row[1]),
+            last_modified=row[2] if len(row) > 2 else None,
+            row_count=row[3] if len(row) > 3 else None,
+            size_bytes=row[4] if len(row) > 4 else None,
+            dialect=dialect,
+        ))
+        out.append(entry)
+    return json.dumps(out, default=str)
 
 
 @server.tool()
 def describe_table(namespace: str, table: str, profile: str | None = None) -> str:
-    """Return a table's columns + types + nullability. JSON array of
-    `{column, type, nullable, position}` objects.
+    """Describe one table: its columns, and whether it is the one you
+    should be using.
+
+    Returns an object with `columns` (each `{column, type, nullable,
+    position}`) plus, when the operator has said anything about this
+    table, `status` (`canonical` / `deprecated`), `note`,
+    `superseded_by`, and a `freshness` block. Check `status` before
+    building a query on it — a deprecated table will still answer
+    perfectly good SQL with the wrong numbers.
+
+    `freshness.state` is one of `fresh`, `stale`, `unrated` (nobody set a
+    threshold) or `unknown` (**the source cannot report a
+    last-modified time at all** — notably Postgres, which has no honest
+    signal for it). `unknown` is not `fresh`; if you need to know, ask.
 
     For `adbc` profiles `namespace` is the schema alone (`ACCOUNT_USAGE`,
     not `SNOWFLAKE.ACCOUNT_USAGE`) and the types come back in the
@@ -535,8 +575,10 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
     `VARCHAR` / `BIGINT`. That is the vocabulary you want when writing
     SQL for that source.
     """
+    observed: tuple = ()
     try:
         prof = _profile_of(profile)
+        dialect = freshness.source_dialect(prof)
         if _prefer_native(prof):
             with _open_native(profile) as (con, handle, _prof):
                 _cols, rows = _native(con, handle, (
@@ -546,6 +588,18 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
                     f"  AND table_name = {_lit(table)} "
                     "ORDER BY ordinal_position"
                 ))
+                # A second statement, but on the already-open handle —
+                # one more round trip, not a reconnect, and nowhere near
+                # the eager-catalog path that cost minutes.
+                extra = freshness.listing_columns(dialect)
+                if extra:
+                    _c, found = _native(con, handle, (
+                        f"SELECT {extra} FROM information_schema.tables t"
+                        + freshness.listing_join(dialect)
+                        + f" WHERE t.table_schema = {_lit(namespace)}"
+                        f"   AND t.table_name = {_lit(table)}"
+                    ))
+                    observed = tuple(found[0]) if found else ()
         else:
             with _open(profile) as (con, catalog):
                 rows = con.execute(
@@ -557,11 +611,21 @@ def describe_table(namespace: str, table: str, profile: str | None = None) -> st
                 ).fetchall()
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
         return _error(e)
-    return json.dumps([
+
+    out: dict[str, Any] = {"namespace": namespace, "table": table}
+    out.update(freshness.describe(
+        prof, prof.annotation_for(namespace, table),
+        last_modified=observed[0] if len(observed) > 0 else None,
+        row_count=observed[1] if len(observed) > 1 else None,
+        size_bytes=observed[2] if len(observed) > 2 else None,
+        dialect=dialect,
+    ))
+    out["columns"] = [
         {"column": r[0], "type": r[1], "nullable": str(r[2]).upper() in ("YES", "TRUE"),
          "position": int(r[3])}
         for r in rows
-    ])
+    ]
+    return json.dumps(out, default=str)
 
 
 # --------------------------------------------------------------------------
@@ -850,9 +914,19 @@ def search_objects(
             })
             continue
         searched.append(target or cfg.default or "(default)")
-        if all_profiles:
-            for item in found:
+        # Annotations only — config lookups, no extra query. Freshness
+        # here would mean a second round trip per search.
+        prof = cfg.get(target)
+        for item in found:
+            if all_profiles:
                 item["profile"] = target
+            if item["table"]:
+                ann = prof.annotation_for(item["namespace"], item["table"])
+                status = freshness.status_for(prof, ann)
+                if status != "unknown":
+                    item["status"] = status
+                if ann is not None and ann.superseded_by:
+                    item["superseded_by"] = ann.superseded_by
         results.extend(found)
         truncated = trunc if truncated is None else max(truncated, trunc or 0) or None
 

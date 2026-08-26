@@ -295,13 +295,17 @@ def test_introspection_goes_to_the_source_for_adbc(adbc_config, fake_native):
     lakesh_mcp.list_tables(namespace="ACCOUNT_USAGE")
     lakesh_mcp.describe_table("ACCOUNT_USAGE", "WAREHOUSE_METERING_HISTORY")
 
-    assert len(fake_native.statements) == 3
-    schemata, tables, columns = fake_native.statements
+    # Four, not three: on a dialect that can report freshness,
+    # describe_table also asks for it — on the already-open handle, so
+    # one extra round trip rather than a reconnect.
+    assert len(fake_native.statements) == 4
+    schemata, tables, columns, table_meta = fake_native.statements
     assert "information_schema.schemata" in schemata
     assert "information_schema.tables" in tables
     assert "'ACCOUNT_USAGE'" in tables
     assert "information_schema.columns" in columns
     assert "'WAREHOUSE_METERING_HISTORY'" in columns
+    assert "last_altered" in table_meta
     # No table_catalog predicate: the native connection is already scoped
     # to one database, and DuckDB's catalog alias is meaningless there.
     assert "table_catalog" not in tables

@@ -63,6 +63,7 @@ only; DuckLake profiles use `postgres_dsn`, `data_path`, and `catalog`.
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import tomllib
@@ -119,6 +120,63 @@ SUPPORTED_TYPES = ("iceberg-rest", "ducklake", "adbc")
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# --------------------------------------------------------------------------
+# table annotations: what an operator asserts about a table
+#
+# The observed half of freshness (a last-modified timestamp) is only
+# available on some sources — see `lakesh.freshness`. The *declared*
+# half works everywhere, which is why it lives in config: an agent can
+# be told "this table is the canonical one and should be under six hours
+# old" regardless of whether the source can confirm the second part.
+
+TABLE_STATUSES = ("canonical", "deprecated", "unknown")
+
+_ANNOTATION_KEYS = frozenset({"status", "max_staleness", "note", "superseded_by"})
+
+_DURATION_RE = re.compile(r"(\d+)\s*([smhdw])", re.IGNORECASE)
+_DURATION_FULL_RE = re.compile(r"^(?:\s*\d+\s*[smhdw]\s*)+$", re.IGNORECASE)
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(text: str, context: str = "") -> int:
+    """Seconds from a compact duration: "45m", "24h", "7d", "1h30m".
+
+    A bare number is rejected rather than guessed at. "24" is 24 hours to
+    whoever is writing a freshness threshold and 24 seconds to
+    `time.sleep`, and silently picking one makes either every table stale
+    or every table fresh — both of which look like the feature working.
+    """
+    raw = str(text).strip()
+    if not _DURATION_FULL_RE.match(raw):
+        where = f"{context}: " if context else ""
+        raise ConfigError(
+            f'{where}cannot parse duration {text!r} — use a unit, '
+            f'e.g. "45m", "24h", "7d" (bare numbers are ambiguous)'
+        )
+    return sum(
+        int(n) * _DURATION_UNITS[unit.lower()]
+        for n, unit in _DURATION_RE.findall(raw)
+    )
+
+
+@dataclass
+class TableAnnotation:
+    """What the operator says about one table, or a glob of them."""
+    pattern: str
+    status: str = "unknown"
+    max_staleness: str = ""
+    """As written, kept for error messages and for echoing back."""
+    max_staleness_seconds: int | None = None
+    note: str = ""
+    superseded_by: str = ""
+
+    @property
+    def is_empty(self) -> bool:
+        return not (
+            self.status != "unknown" or self.max_staleness_seconds
+            or self.note or self.superseded_by
+        )
+
 
 @dataclass
 class Profile:
@@ -145,9 +203,45 @@ class Profile:
     for less but never more, the same way `read_only` cannot be widened
     by `LAKESH_MCP_WRITE`. Unset means the MCP server's own default
     applies."""
+    status: str = "unknown"
+    """Profile-wide default for `TableAnnotation.status`."""
+    max_staleness: str = ""
+    max_staleness_seconds: int | None = None
+    """Profile-wide default freshness threshold, used for any table
+    without one of its own."""
+    tables: dict[str, TableAnnotation] = field(default_factory=dict)
+    """Per-table annotations, keyed by `SCHEMA.TABLE` (globs allowed)."""
     # shared
     s3: S3Config = field(default_factory=S3Config)
     oauth: OAuthConfig = field(default_factory=OAuthConfig)
+
+    def annotation_for(self, namespace: str, table: str) -> TableAnnotation | None:
+        """The most specific annotation matching `SCHEMA.TABLE`.
+
+        Specificity, not file order, decides: an exact key beats a glob,
+        and a longer glob beats a shorter one, so `ANALYTICS.DIM_*` wins
+        over `ANALYTICS.*` no matter which was written first.
+
+        Matching is case-insensitive because Snowflake upper-cases
+        unquoted identifiers and Postgres lower-cases them — the same
+        logical table is spelled two ways depending on which source you
+        ask, and an operator should not have to know which.
+        """
+        if not self.tables:
+            return None
+        key = f"{namespace}.{table}".casefold()
+        best: TableAnnotation | None = None
+        best_len = -1
+        for pattern, ann in self.tables.items():
+            folded = pattern.casefold()
+            if folded == key:
+                return ann
+            # fnmatchcase on pre-folded strings, never fnmatch: fnmatch
+            # applies os.path.normcase, which would make the semantics
+            # of a config file depend on the platform reading it.
+            if fnmatch.fnmatchcase(key, folded) and len(folded) > best_len:
+                best, best_len = ann, len(folded)
+        return best
 
     def validate(self) -> None:
         if self.type not in SUPPORTED_TYPES:
@@ -192,6 +286,19 @@ class Profile:
                     f"`token_option` (the ADBC option that receives the "
                     f"bearer token) or a \"{{token}}\" placeholder in an "
                     f"option value"
+                )
+        # Type-agnostic: annotations apply to every profile type.
+        if self.status not in TABLE_STATUSES:
+            raise ConfigError(
+                f"profile {self.name!r}: unknown status {self.status!r} "
+                f"(supported: {', '.join(TABLE_STATUSES)})"
+            )
+        for ann in self.tables.values():
+            if ann.status not in TABLE_STATUSES:
+                raise ConfigError(
+                    f"profile {self.name!r}: table {ann.pattern!r}: unknown "
+                    f"status {ann.status!r} "
+                    f"(supported: {', '.join(TABLE_STATUSES)})"
                 )
         if self.oauth.enabled and self.type != "ducklake":
             self._validate_oauth()
@@ -324,6 +431,51 @@ def _parse_timeout(name: str, value: Any) -> float | None:
     return seconds
 
 
+def _parse_table_annotation(profile: str, key: str, raw: Any) -> TableAnnotation:
+    """One `[profiles.X.tables]` entry.
+
+    The key must be quoted in TOML — an unquoted `ANALYTICS.FCT_ORDERS`
+    is dotted-key syntax and silently nests into
+    `{"ANALYTICS": {"FCT_ORDERS": …}}` instead of becoming a literal
+    key, so the resulting annotation would never match anything.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"profile {profile!r}: [profiles.{profile}.tables] entry {key!r} "
+            f'must be a table, e.g. {{ status = "canonical" }}'
+        )
+    if "." not in key:
+        raise ConfigError(
+            f"profile {profile!r}: table key {key!r} must be SCHEMA.TABLE "
+            f'(quote it — use "*.{key}" to match that table in any schema)'
+        )
+    # `_parse_profile` ignores unknown keys, which for a governance
+    # feature is the worst possible failure: `max_stalenes = "24h"` would
+    # parse clean and the annotation would silently never apply, while
+    # the operator believes the table is marked. Guard the annotation's
+    # own keys — narrowly, without imposing a profile-wide key-set diff
+    # that would break existing configs.
+    unknown = sorted(set(raw) - _ANNOTATION_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"profile {profile!r}: table {key!r}: unknown key"
+            f"{'s' if len(unknown) > 1 else ''} {', '.join(repr(u) for u in unknown)} "
+            f"(supported: {', '.join(sorted(_ANNOTATION_KEYS))})"
+        )
+    staleness = str(raw.get("max_staleness", ""))
+    return TableAnnotation(
+        pattern=key,
+        status=str(raw.get("status", "unknown")),
+        max_staleness=staleness,
+        max_staleness_seconds=(
+            parse_duration(staleness, f"profile {profile!r} table {key!r}")
+            if staleness else None
+        ),
+        note=str(raw.get("note", "")),
+        superseded_by=str(raw.get("superseded_by", "")),
+    )
+
+
 def _parse_profile(name: str, raw: dict) -> Profile:
     s3_raw = raw.get("s3") or {}
     s3 = S3Config(
@@ -366,6 +518,14 @@ def _parse_profile(name: str, raw: dict) -> Profile:
     # credentials embedded in the connection URI — keeps the password out
     # of the config file, like `postgres_dsn_env` for ducklake.
     uri = _resolve_env(raw.get("uri"), raw.get("uri_env")) or ""
+    tables_raw = raw.get("tables") or {}
+    if not isinstance(tables_raw, dict):
+        raise ConfigError(f"profile {name!r}: `tables` must be a table")
+    tables = {
+        str(key): _parse_table_annotation(name, str(key), value)
+        for key, value in tables_raw.items()
+    }
+    profile_staleness = str(raw.get("max_staleness", ""))
     p = Profile(
         name=name,
         type=ptype,
@@ -379,6 +539,13 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         token_option=str(raw.get("token_option", "")),
         read_only=bool(raw.get("read_only", False)),
         query_timeout_s=_parse_timeout(name, raw.get("query_timeout_s")),
+        status=str(raw.get("status", "unknown")),
+        max_staleness=profile_staleness,
+        max_staleness_seconds=(
+            parse_duration(profile_staleness, f"profile {name!r}")
+            if profile_staleness else None
+        ),
+        tables=tables,
         s3=s3,
         oauth=oauth,
     )
@@ -511,6 +678,14 @@ path_style = true
 # "adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"    # required
 # "adbc.snowflake.sql.warehouse" = "MY_WH"
 # "adbc.snowflake.sql.db"        = "SNOWFLAKE"
+#
+# # Which tables an agent should trust. Keys MUST be quoted — unquoted,
+# # ANALYTICS.FCT_REVENUE is TOML dotted-key syntax and nests silently
+# # instead of becoming a literal key. Globs allowed; most specific wins.
+# [profiles.snowflake.tables]
+# "ANALYTICS.FCT_REVENUE"    = { status = "canonical", max_staleness = "6h" }
+# "ANALYTICS.FCT_REVENUE_V1" = { status = "deprecated", superseded_by = "ANALYTICS.FCT_REVENUE" }
+# "STAGING.*"                = { status = "deprecated", note = "raw landing zone" }
 
 # --- ADBC + OAuth2 device-code login (e.g. Snowflake via an IdP) ----------
 # No `username` option: the Snowflake driver parses the ATTACH path as a

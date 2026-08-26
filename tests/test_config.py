@@ -613,3 +613,158 @@ query_timeout_s = "half an hour"
     with pytest.raises(ConfigError) as e:
         load_config(p)
     assert "must be a number" in str(e.value)
+
+
+# --------------------------------------------------------------------------
+# table annotations
+
+
+_ANNOTATED = """
+default = "snow"
+
+[profiles.snow]
+type          = "adbc"
+driver        = "snowflake"
+uri           = "u:p@ACC"
+catalog       = "snow"
+status        = "canonical"
+max_staleness = "24h"
+
+[profiles.snow.tables]
+"ANALYTICS.FCT_REVENUE"    = {{ status = "canonical", max_staleness = "6h", note = "truth" }}
+"ANALYTICS.FCT_REVENUE_V1" = {{ status = "deprecated", superseded_by = "ANALYTICS.FCT_REVENUE" }}
+"ANALYTICS.*"              = {{ max_staleness = "2d" }}
+"ANALYTICS.DIM_*"          = {{ max_staleness = "7d" }}
+"""
+
+
+def test_table_annotations_parse(tmp_path):
+    prof = load_config(_write(tmp_path, _ANNOTATED.format())).get("snow")
+    assert prof.status == "canonical"
+    assert prof.max_staleness_seconds == 86400
+    ann = prof.tables["ANALYTICS.FCT_REVENUE"]
+    assert ann.status == "canonical"
+    assert ann.max_staleness_seconds == 21600
+    assert ann.note == "truth"
+
+
+def test_annotation_lookup_prefers_the_most_specific(tmp_path):
+    """Specificity, not file order: an exact key beats a glob and a
+    longer glob beats a shorter one, so ANALYTICS.DIM_* wins over
+    ANALYTICS.* however they were written."""
+    prof = load_config(_write(tmp_path, _ANNOTATED.format())).get("snow")
+
+    assert prof.annotation_for("ANALYTICS", "FCT_REVENUE").pattern == "ANALYTICS.FCT_REVENUE"
+    assert prof.annotation_for("ANALYTICS", "DIM_CUSTOMER").pattern == "ANALYTICS.DIM_*"
+    assert prof.annotation_for("ANALYTICS", "OTHER").pattern == "ANALYTICS.*"
+    assert prof.annotation_for("STAGING", "X") is None
+
+
+def test_annotation_lookup_is_case_insensitive_both_ways(tmp_path):
+    """Snowflake upper-cases unquoted identifiers and Postgres
+    lower-cases them, so the same logical table is spelled two ways
+    depending on which source you ask."""
+    prof = load_config(_write(tmp_path, _ANNOTATED.format())).get("snow")
+    assert prof.annotation_for("analytics", "fct_revenue").status == "canonical"
+
+    lower = load_config(_write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+
+[profiles.pg.tables]
+"public.orders" = { status = "canonical" }
+""")).get("pg")
+    assert lower.annotation_for("PUBLIC", "ORDERS").status == "canonical"
+
+
+def test_unknown_status_is_rejected(tmp_path):
+    p = _write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+
+[profiles.pg.tables]
+"public.orders" = { status = "blessed" }
+""")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "blessed" in str(e.value) and "public.orders" in str(e.value)
+
+
+def test_unknown_annotation_key_is_rejected(tmp_path):
+    """The worst failure mode for a governance feature is a typo that
+    parses clean: the operator believes the table is marked and it never
+    matches anything."""
+    p = _write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+
+[profiles.pg.tables]
+"public.orders" = { max_stalenes = "24h" }
+""")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "max_stalenes" in str(e.value)
+
+
+def test_table_key_must_be_qualified(tmp_path):
+    """An unquoted ANALYTICS.FCT_ORDERS is TOML dotted-key syntax and
+    nests instead of becoming a literal key, so the resulting annotation
+    would silently never match."""
+    p = _write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+
+[profiles.pg.tables]
+orders = { status = "canonical" }
+""")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "SCHEMA.TABLE" in str(e.value)
+
+
+def test_bad_duration_in_an_annotation_names_the_table(tmp_path):
+    p = _write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+
+[profiles.pg.tables]
+"public.orders" = { max_staleness = "24" }
+""")
+    with pytest.raises(ConfigError) as e:
+        load_config(p)
+    assert "public.orders" in str(e.value) and "duration" in str(e.value)
+
+
+def test_profiles_without_annotations_are_unchanged(tmp_path):
+    prof = load_config(_write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+""")).get("pg")
+    assert prof.tables == {}
+    assert prof.status == "unknown"
+    assert prof.max_staleness_seconds is None
+    assert prof.annotation_for("public", "orders") is None

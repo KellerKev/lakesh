@@ -36,3 +36,28 @@ type    = "adbc"
 driver  = "postgresql"
 uri     = "postgresql://reporting:hunter2@db.example.com:5432/staging"
 catalog = "stg"
+
+# ---------------------------------------------------------------------------
+# Freshness: what Postgres cannot tell you
+#
+# You can annotate tables here exactly as in the Snowflake example:
+#
+#   [profiles.pg.tables]
+#   "public.orders" = { status = "canonical", note = "the one to use" }
+#
+# ...but the FRESHNESS half will report `state: "unknown"` on Postgres,
+# and that is deliberate. ANSI information_schema.tables has no temporal
+# column at all, and the only timestamps Postgres exposes
+# (pg_stat_user_tables.last_analyze / last_autovacuum) are
+# statistics-collector artifacts: NULL until autovacuum happens to fire,
+# wiped by pg_stat_reset(), and decoupled from when a row last landed.
+#
+# Surfacing one of those as `last_modified` would hand an agent a vacuum
+# timestamp labelled as data freshness — worse than reporting nothing,
+# because "unknown" makes an agent go and ask while a wrong timestamp
+# makes it confidently proceed.
+#
+# What you do get on Postgres is size: `bytes` from
+# pg_total_relation_size, and a `row_count` from pg_class.reltuples
+# flagged `row_count_is_estimate`. A table that has never been ANALYZEd
+# reports no count at all rather than zero.

@@ -453,7 +453,7 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `search_objects(pattern, profile=None, namespace=None, match="all", limit=200, all_profiles=False)` | **Find** a schema, table or column by name |
 | `list_namespaces(profile=None)` | List schemas in a profile's catalog |
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
-| `describe_table(namespace, table, profile=None)` | Columns + types + nullability |
+| `describe_table(namespace, table, profile=None)` | Columns, plus whether this is the table to use |
 | `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None, estimate=False)` | Run SQL and return results |
 
 ### Finding things — `search_objects`
@@ -628,6 +628,93 @@ or `native=false` to plan through DuckDB.
 `estimated_rows` appears **only when a real number was extracted** —
 never as a `null` or a `0`. A model reading `estimated_rows: 0`
 concludes the query is free.
+
+### Freshness and canonicality
+
+An agent can run perfectly correct SQL against the wrong table and never
+know. Mark up your tables and `list_tables`, `describe_table` and
+`search_objects` will carry the warning:
+
+```toml
+[profiles.snow]
+status        = "canonical"   # profile-wide default
+max_staleness = "24h"
+
+[profiles.snow.tables]
+"ANALYTICS.FCT_REVENUE"    = { status = "canonical", max_staleness = "6h", note = "billing source of truth" }
+"ANALYTICS.FCT_REVENUE_V1" = { status = "deprecated", superseded_by = "ANALYTICS.FCT_REVENUE" }
+"STAGING.*"                = { status = "deprecated", note = "raw landing zone; do not query" }
+```
+
+Keys **must be quoted** — an unquoted `ANALYTICS.FCT_REVENUE` is TOML
+dotted-key syntax and nests silently instead of becoming a literal key.
+Globs are allowed, and the **most specific** match wins regardless of
+file order: an exact key beats a glob, a longer glob beats a shorter one.
+Matching is case-insensitive, because Snowflake upper-cases unquoted
+identifiers and Postgres lower-cases them.
+
+```jsonc
+describe_table("ANALYTICS", "FCT_REVENUE")
+{"namespace": "ANALYTICS", "table": "FCT_REVENUE",
+ "status": "canonical", "note": "billing source of truth",
+ "freshness": {"state": "fresh", "age_seconds": 3991,
+               "last_modified": "2026-08-26T10:35:07+02:00",
+               "max_staleness_seconds": 21600, "source": "LAST_ALTERED"},
+ "columns": [...]}
+```
+
+Fields are **omitted when there is nothing to say**, so a catalog with no
+annotations against a source with no timestamps produces the same output
+it always did.
+
+#### Which sources can actually report freshness
+
+This is asymmetric and the output is designed to make the gaps visible
+rather than paper over them.
+
+| Source | Timestamp | Reported |
+|---|---|---|
+| Snowflake | `LAST_ALTERED` | `last_modified`, `row_count`, `bytes` |
+| Postgres | **none** | `row_count` (estimate) and `bytes` only |
+| Other ADBC | none | nothing |
+| Iceberg REST / DuckLake | not yet | nothing |
+
+`freshness.state` is one of four values, and the fourth is the point:
+
+- `fresh` / `stale` — a timestamp and a threshold both exist.
+- `unrated` — the age is known, nobody said what is acceptable.
+- `unknown` — **the source cannot report a last-modified time at all.**
+
+`unknown` is never rendered as `fresh`. An agent reading a missing signal
+as a passing one is the exact failure this feature exists to prevent.
+
+Two caveats worth internalising:
+
+- **Postgres has no honest freshness signal, and lakesh will not invent
+  one.** Its ANSI `information_schema.tables` has no temporal column at
+  all. The only timestamps available are
+  `pg_stat_user_tables.last_analyze` / `last_autovacuum`, which are
+  statistics-collector artifacts — NULL until autovacuum happens to
+  fire, wiped by `pg_stat_reset()`, and decoupled from when a row last
+  landed. Reporting one as `last_modified` would be worse than reporting
+  nothing: "unknown" makes an agent ask, a wrong timestamp makes it
+  confidently proceed. Row counts come from `pg_class.reltuples` and are
+  flagged `row_count_is_estimate`; a table that has never been
+  `ANALYZE`d reports no count rather than zero.
+- **Snowflake's `LAST_ALTERED` is a signal, not a proof.** It moves on
+  DDL and metadata operations as well as DML, and on a view it tracks the
+  definition changing rather than the data. It is labelled
+  `"source": "LAST_ALTERED"` so you can discount it accordingly.
+  `row_count` and `bytes` are NULL for views and external tables.
+
+On Snowflake, freshness on `list_tables` costs **zero extra round trips**
+— the columns ride on the query already being sent. Measured: 203 tables
+with freshness in 6.4s. `describe_table` costs one extra statement on the
+already-open handle.
+
+Annotations are **unenforced assertions**: nothing checks that
+`ANALYTICS.FCT_REVENUE` still exists, so a rename silently drops its
+annotation and the deprecated twin keeps looking clean.
 
 ### Credentials never reach the model
 

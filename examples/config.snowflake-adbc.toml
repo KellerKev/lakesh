@@ -105,3 +105,27 @@ read_only = true                     # refuses writes even with LAKESH_MCP_WRITE
 # "adbc.snowflake.sql.account"   = "MYORG-ACCOUNT"
 # "adbc.snowflake.sql.warehouse" = "MY_WH"
 # "adbc.snowflake.sql.db"        = "ANALYTICS"
+
+# ---------------------------------------------------------------------------
+# Telling an agent which table to trust
+#
+# An agent can run perfectly correct SQL against the wrong table and
+# never know. Annotate the ones that matter and lakesh carries the
+# warning into list_tables, describe_table and search_objects.
+#
+# Keys MUST be quoted: an unquoted ANALYTICS.FCT_REVENUE is TOML
+# dotted-key syntax and nests silently instead of becoming a literal
+# key, so the annotation would never match anything. Globs are allowed
+# and the most specific match wins regardless of order here.
+
+# [profiles.snowflake.tables]
+# "ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY" = { status = "canonical", max_staleness = "6h", note = "billing source of truth" }
+# "ACCOUNT_USAGE.*"                          = { max_staleness = "7d" }
+# "STAGING.*"                                = { status = "deprecated", note = "raw landing zone; do not query" }
+
+# Snowflake is the source that can actually confirm the freshness half:
+# INFORMATION_SCHEMA.TABLES carries LAST_ALTERED, ROW_COUNT and BYTES,
+# and lakesh reads them on the query it is already sending, so this
+# costs no extra round trips. Note LAST_ALTERED moves on DDL as well as
+# DML, and on a view tracks the definition rather than the data — it is
+# a staleness signal, not a proof.
