@@ -948,3 +948,101 @@ def test_describe_table_rejects_an_unknown_shape(adbc_config, fake_native):
     out = json.loads(lakesh_mcp.describe_table("S", "T", shape="bare"))
     assert "unknown shape" in out["error"]
     assert fake_native.statements == []
+
+
+# --------------------------------------------------------------------------
+# the read-only ratchet
+#
+# The property under test is that a restriction only ever tightens, and
+# that a refusal says which layer imposed it — a caller told only
+# "blocked" retries uselessly.
+
+
+@pytest.fixture(autouse=True)
+def _fresh_guard_session():
+    from lakesh import guard
+    guard.SESSION.reset_for_tests()
+    yield
+    guard.SESSION.reset_for_tests()
+
+
+def test_set_read_only_latches_for_the_session(adbc_config, fake_native):
+    out = json.loads(lakesh_mcp.set_read_only())
+    assert out["restriction"]["read_only"] is True
+    assert out["restriction"]["relaxable"] is False
+
+    blocked = json.loads(lakesh_mcp.query("DROP TABLE t", profile="snow"))
+    assert blocked["error_type"] == "read_only_blocked"
+    assert blocked["blocked"] == "DROP"
+    assert blocked["restriction"]["set_by"] == "set_read_only tool"
+    assert fake_native.statements == []
+
+
+def test_set_read_only_catches_a_smuggled_write(adbc_config, fake_native):
+    """The stronger scan runs once a restriction is in force. This
+    statement passes the leading-keyword gate."""
+    lakesh_mcp.set_read_only()
+    out = json.loads(lakesh_mcp.query(
+        "WITH x AS (INSERT INTO t VALUES (1)) SELECT * FROM x", profile="snow"))
+    assert out["blocked"] == "INSERT"
+    assert fake_native.statements == []
+
+
+def test_read_only_param_narrows_one_call_without_latching(adbc_config, fake_native):
+    """A routine parameter quietly restricting the rest of the session
+    would surprise the caller; set_read_only is the latch."""
+    blocked = json.loads(lakesh_mcp.query("DROP TABLE t", profile="snow", read_only=True))
+    assert blocked["error_type"] == "read_only_blocked"
+    assert blocked["restriction"]["set_by"] == "query(read_only=True)"
+
+    from lakesh import guard
+    assert guard.SESSION.effective().read_only is False
+
+
+def test_session_status_reports_the_effective_restriction(adbc_config):
+    before = json.loads(lakesh_mcp.session_status())
+    assert before["restriction"]["read_only"] is False
+    lakesh_mcp.set_read_only()
+    after = json.loads(lakesh_mcp.session_status())
+    assert after["restriction"]["read_only"] is True
+    assert "this session" in after["summary"]
+
+
+def test_write_env_cannot_widen_a_latched_restriction(adbc_config, fake_native, monkeypatch):
+    monkeypatch.setenv("LAKESH_MCP_WRITE", "1")
+    lakesh_mcp.set_read_only()
+    out = json.loads(lakesh_mcp.query("DROP TABLE t", profile="snow"))
+    assert out["error_type"] == "read_only_blocked"
+
+
+def test_profile_read_only_is_reported_as_policy(tmp_path, monkeypatch, fake_native):
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "ro"
+
+[profiles.ro]
+type      = "adbc"
+driver    = "/x/driver.so"
+uri       = "user@ACCOUNT"
+read_only = true
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    out = json.loads(lakesh_mcp.query("DROP TABLE t"))
+    assert out["restriction"]["source"] == "policy"
+    assert "read_only" in out["restriction"]["set_by"]
+    # Policy restrictions cannot be relaxed from the caller's side.
+    assert "LAKESH_MCP_WRITE does not override it" in out["error"]
+
+
+def test_env_read_only_restricts_the_server(adbc_config, fake_native, monkeypatch):
+    monkeypatch.setenv("LAKESH_READ_ONLY", "1")
+    out = json.loads(lakesh_mcp.query("INSERT INTO t VALUES (1)", profile="snow"))
+    assert out["restriction"]["set_by"] == "LAKESH_READ_ONLY"
+    assert out["restriction"]["source"] == "policy"
+
+
+def test_reads_are_untouched_by_a_restriction(adbc_config, fake_native):
+    lakesh_mcp.set_read_only()
+    out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow"))
+    assert "error" not in out
+    assert fake_native.statements == ["SELECT 1"]

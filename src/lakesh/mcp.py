@@ -93,19 +93,16 @@ from .duck import (
 )
 from . import freshness
 from .oauth import AuthRequired
+from . import guard
 from .output import _stringify  # type: ignore[attr-defined]
 from .redact import profile_secrets, redact_uri, scrub
 
 
-_READ_ONLY_LEADING = re.compile(r"^\s*(select|show|describe|desc|with|explain|pragma|values)\b", re.IGNORECASE)
-
-
-def _is_read_only(sql: str) -> bool:
-    """Cheap structural check — covers the obvious top-level cases. A
-    determined caller can still smuggle writes inside a `WITH … INSERT`
-    CTE; the safety net is meant to catch accidental misuse, not a
-    motivated attacker."""
-    return bool(_READ_ONLY_LEADING.match(sql.strip().lstrip("(")))
+# The write gate lives in `guard`, so there is one place that knows what a
+# write looks like. Re-exported here because this module and its tests have
+# always referred to it by these names.
+_READ_ONLY_LEADING = guard._READ_ONLY_LEADING
+_is_read_only = guard.is_read_only
 
 
 def _writes_enabled() -> bool:
@@ -433,7 +430,9 @@ server = FastMCP(
         "dialect straight through, and table names are the source's own "
         "(e.g. SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY). Writes are disabled "
         "unless the operator set LAKESH_MCP_WRITE=1, and a profile marked "
-        "read_only refuses them either way."
+        "read_only refuses them either way. Call `session_status` to see "
+        "what this session is allowed to do, and `set_read_only` to give "
+        "up write access for the rest of it."
     ),
 )
 
@@ -470,6 +469,43 @@ def list_profiles() -> str:
             entry["max_staleness_seconds"] = p.max_staleness_seconds
         out.append(entry)
     return json.dumps(out)
+
+
+@server.tool()
+def set_read_only() -> str:
+    """Restrict this session to reads for the rest of its life.
+
+    Takes no argument on purpose: there is no way to turn it back off.
+    Once set, every `query` call in this session refuses writes, and the
+    only way to regain write access is to start a new session. Call it
+    when you are about to explore a source you do not intend to modify —
+    it costs nothing and removes a whole class of accident.
+
+    Idempotent. Returns the effective restriction and where it came from.
+    """
+    guard.SESSION.narrow("set_read_only tool")
+    restriction = guard.SESSION.effective()
+    return json.dumps({
+        "ok": True,
+        "restriction": restriction.as_dict(),
+        "note": restriction.describe(),
+    })
+
+
+@server.tool()
+def session_status() -> str:
+    """What this session is currently allowed to do.
+
+    Worth checking before assuming a failure was the source's fault: a
+    refused write may be a restriction the operator set, in which case
+    retrying will not help.
+    """
+    restriction = guard.SESSION.effective()
+    return json.dumps({
+        "restriction": restriction.as_dict(),
+        "summary": restriction.describe(),
+        "writes_enabled_by_env": _writes_enabled(),
+    })
 
 
 def _profile_of(profile: str | None) -> Profile:
@@ -1086,6 +1122,7 @@ def query(
     native: bool | None = None,
     timeout_s: float | None = None,
     estimate: bool | str = False,
+    read_only: bool = False,
 ) -> str:
     """Run a SQL statement and return its result.
 
@@ -1145,12 +1182,21 @@ def query(
                 present only when a real number was extracted — never as
                 a null or a zero.
 
+        read_only: refuse writes for this call. Narrows only — it cannot
+                re-enable writes that policy already forbids, and it does
+                NOT latch: use `set_read_only()` to restrict the whole
+                session. When any restriction is in force the write check
+                is the stronger one, which also catches a write smuggled
+                inside a CTE or after a `;`.
+
     Writes (INSERT / UPDATE / DELETE / DDL / DROP) are rejected unless
     the server was started with `LAKESH_MCP_WRITE=1` in its environment.
     A profile with `read_only = true` refuses them regardless: the
     profile is the more specific statement of intent, and native mode
     opens its own ADBC connection that the ATTACH's READ_ONLY flag never
-    sees.
+    sees. A rejection says which layer imposed the restriction, because
+    one that cannot be relaxed from here is worth knowing about before
+    retrying.
     """
     sql = sql.strip().rstrip(";")
     if not sql:
@@ -1173,19 +1219,26 @@ def query(
     except (ConfigError, RuntimeError) as e:
         return _error(e)
 
-    if not _is_read_only(sql):
-        if prof.read_only:
-            return _error(
-                f"non-SELECT statement rejected: profile {prof.name!r} is "
-                f"marked read_only in the config. That is deliberate and "
-                f"LAKESH_MCP_WRITE does not override it."
-            )
-        if not _writes_enabled():
-            return _error(
-                "non-SELECT statement rejected. The MCP server is in "
-                "read-only mode — set LAKESH_MCP_WRITE=1 in the server's "
-                "environment to enable writes."
-            )
+    # A per-call `read_only=True` narrows this statement only — it
+    # deliberately does not latch, because a routine parameter quietly
+    # restricting the rest of the session would surprise the caller.
+    # `set_read_only()` is the latch.
+    restriction = guard.SESSION.effective(prof)
+    if read_only and not restriction.read_only:
+        restriction = guard.Restriction(True, guard.USER, "query(read_only=True)")
+
+    if restriction.read_only:
+        # The stronger scan runs only when a restriction is in force, which
+        # caps the blast radius of it being imperfect.
+        blocked = guard.blocks_write(sql)
+        if blocked:
+            return json.dumps(guard.refusal(restriction, blocked))
+    elif not _is_read_only(sql) and not _writes_enabled():
+        return _error(
+            "non-SELECT statement rejected. The MCP server is in "
+            "read-only mode — set LAKESH_MCP_WRITE=1 in the server's "
+            "environment to enable writes."
+        )
 
     use_native = _prefer_native(prof) if native is None else bool(native)
     if use_native and prof.type != "adbc":
@@ -1288,7 +1341,7 @@ def query(
     return _rows_as_table(columns, rows) + footer + ")"
 
 
-def serve(config_path: Path | None = None) -> None:
+def serve(config_path: Path | None = None, read_only: bool = False) -> None:
     """Run the MCP server on stdio — the entry point `lakesh mcp` calls.
 
     `config_path` is exported as `$LAKESH_CONFIG` rather than threaded
@@ -1298,6 +1351,10 @@ def serve(config_path: Path | None = None) -> None:
     """
     if config_path is not None:
         os.environ["LAKESH_CONFIG"] = str(config_path)
+    if read_only:
+        # Policy layer: set before any tool runs, so it applies to every
+        # call and cannot be relaxed by one.
+        guard.SESSION.set_policy_flag("lakesh mcp --read-only")
     server.run()
 
 

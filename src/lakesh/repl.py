@@ -16,6 +16,7 @@ from prompt_toolkit.styles import Style
 from pygments.lexers.sql import SqlLexer
 from rich.console import Console
 
+from . import guard
 from .config import Profile
 from .duck import catalog_alias
 from .output import render_table
@@ -31,6 +32,7 @@ Meta-commands (psql-like):
   \\d <ns>.<tbl>   describe a table (columns + types)
   \\timing [on|off]  toggle / show per-query elapsed-time reporting
   \\format [table|json|csv]  change result format
+  \\readonly       refuse writes for the rest of this session (cannot be undone)
   \\e              edit the last query in $EDITOR (not yet implemented)
 """
 
@@ -114,6 +116,7 @@ def _describe(
 def _handle_meta(
     con: duckdb.DuckDBPyConnection, catalog: str,
     console: Console, cmd: str, state: dict,
+    profile: Profile | None = None,
 ) -> bool:
     """Returns True if we should continue the REPL, False to quit."""
     parts = cmd.strip().split()
@@ -153,6 +156,20 @@ def _handle_meta(
             console.print(f"format → [cyan]{state['format']}[/cyan]")
         else:
             console.print(f"[red]unknown format {args[0]!r}[/red]")
+    elif head == r"\readonly":
+        # No `off`. The whole value of the ratchet is that it cannot be
+        # reversed, so a request to reverse it gets an answer rather than
+        # a silent no-op.
+        if args and args[0].lower() in ("off", "0", "false", "no"):
+            console.print(
+                "[red]read-only cannot be turned off — restart the REPL "
+                "for write access[/red]"
+            )
+        elif args:
+            console.print("[red]\\readonly takes no argument[/red]")
+        else:
+            guard.SESSION.narrow(r"\readonly")
+            console.print(f"[cyan]{guard.SESSION.effective(profile).describe()}[/cyan]")
     else:
         console.print(f"[red]unknown meta-command {head!r} (try \\?)[/red]")
     return True
@@ -193,16 +210,25 @@ def run_repl(profile: Profile, con: duckdb.DuckDBPyConnection, console: Console)
     try:
         while True:
             try:
-                raw = session.prompt(f"{profile.name}> ")
+                suffix = "[ro]" if guard.SESSION.effective(profile).read_only else ""
+                raw = session.prompt(f"{profile.name}{suffix}> ")
             except (KeyboardInterrupt, EOFError):
                 break
             text = raw.strip().rstrip(";").strip()
             if not text:
                 continue
             if text.startswith("\\"):
-                if not _handle_meta(con, catalog, console, text, state):
+                if not _handle_meta(con, catalog, console, text, state, profile):
                     break
                 continue
+            restriction = guard.SESSION.effective(profile)
+            if restriction.read_only:
+                blocked = guard.blocks_write(text)
+                if blocked:
+                    console.print(
+                        f"[red]{guard.refusal(restriction, blocked)['error']}[/red]"
+                    )
+                    continue
             t0 = time.perf_counter()
             try:
                 cur = con.execute(text)

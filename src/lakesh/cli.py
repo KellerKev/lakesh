@@ -24,6 +24,7 @@ from .config import (
 from .duck import adbc_native_scan, catalog_alias, connect, connect_native
 from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
+from . import guard
 from .redact import profile_secrets, redact_option, redact_uri, scrub
 
 
@@ -89,10 +90,17 @@ def run(
     warehouse: Optional[str] = typer.Option(
         None, help="Override the profile's `warehouse` (Iceberg REST profiles only)."
     ),
+    read_only: bool = typer.Option(
+        False, "--read-only",
+        help="Refuse writes for this session. Cannot be undone once set — "
+             "start a new session to regain write access.",
+    ),
 ):
     """Open an interactive REPL against a profile's catalog."""
     from .repl import run_repl
 
+    if read_only:
+        guard.SESSION.narrow("--read-only")
     cfg = _load_or_die(config_path)
     try:
         prof = cfg.get(profile)
@@ -141,6 +149,11 @@ def exec(
              "Needed for SHOW / QUALIFY / cross-database queries and a "
              "bare count(*), and far faster against a remote source.",
     ),
+    read_only: bool = typer.Option(
+        False, "--read-only",
+        help="Refuse writes. Applies the stronger check that also catches "
+             "a write smuggled inside a CTE or after a semicolon.",
+    ),
 ):
     """Run a single SQL statement against a profile's catalog and exit.
 
@@ -169,6 +182,20 @@ def exec(
         prof.uri = uri
     if warehouse:
         prof.warehouse = warehouse
+
+    if read_only:
+        guard.SESSION.narrow("--read-only")
+    # Default-open: with no flag, no env var and no profile key this is
+    # `None` and `lakesh exec -q 'INSERT ...'` behaves exactly as it always
+    # has. The stronger scan runs only when a restriction is in force.
+    restriction = guard.SESSION.effective(prof)
+    if restriction.read_only:
+        blocked = guard.blocks_write(query)
+        if blocked:
+            payload = guard.refusal(restriction, blocked)
+            err_console.print(f"[red]{payload['error']}[/red]")
+            raise typer.Exit(code=2)
+        err_console.print(f"[dim]{restriction.describe()}[/dim]")
 
     if native and prof.type != "adbc":
         err_console.print(
@@ -221,6 +248,11 @@ def exec(
 @app.command()
 def mcp(
     config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+    read_only: bool = typer.Option(
+        False, "--read-only",
+        help="Refuse writes for every call this server serves. Operator "
+             "policy: a caller cannot relax it.",
+    ),
 ):
     """Run lakesh as an MCP server on stdio.
 
@@ -238,7 +270,7 @@ def mcp(
     default.
     """
     from .mcp import serve
-    serve(config_path)
+    serve(config_path, read_only=read_only)
 
 
 # --------------------------------------------------------------------------
