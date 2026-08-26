@@ -3,6 +3,15 @@
 
 default = "local"
 
+# Masking: hide recognisable PII in results. "audit" reports what would
+# be masked without masking it — use it to tune the rule set before
+# turning masking on. Applies at RENDER time and is not access control:
+# substr(), LIKE filters, hashing and ORDER BY all defeat it.
+# [masking]
+# mode  = "off"                      # off | mask | audit
+# rules = ["pii.email", "pii.phone"] # override the default-on set
+
+
 # Output shape for the MCP `describe_table` tool: "object" (default)
 # wraps the columns alongside the table's status and freshness; "array"
 # is the older bare list of columns, for clients that already parse it.

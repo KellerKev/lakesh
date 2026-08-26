@@ -25,6 +25,7 @@ from .duck import adbc_native_scan, catalog_alias, connect, connect_native
 from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
 from . import guard
+from . import mask as _mask
 from .redact import profile_secrets, redact_option, redact_uri, scrub
 
 
@@ -154,6 +155,12 @@ def exec(
         help="Refuse writes. Applies the stronger check that also catches "
              "a write smuggled inside a CTE or after a semicolon.",
     ),
+    mask: Optional[str] = typer.Option(
+        None, "--mask",
+        help="Mask recognisable PII in the results: `mask` to replace it, "
+             "`audit` to report what would be masked without masking it. "
+             "Applies at render time — it is not access control.",
+    ),
 ):
     """Run a single SQL statement against a profile's catalog and exit.
 
@@ -220,10 +227,12 @@ def exec(
     except Exception as e:
         err_console.print(f"[red]connect failed:[/red] {scrub(str(e), secrets)}")
         raise typer.Exit(code=1)
+    policy = _mask.resolve(cfg, prof, requested=mask)
     try:
         cur = adbc_native_scan(con, handle, query) if native else con.execute(query)
         columns = [d[0] for d in cur.description] if cur.description else []
         rows = cur.fetchall()
+        rows, mask_report = _mask.mask_rows(policy, columns, rows)
     except Exception as e:
         err_console.print(f"[red]{scrub(str(e), secrets)}[/red]")
         raise typer.Exit(code=1)
@@ -233,6 +242,11 @@ def exec(
     if not columns:
         console.print("[dim]ok[/dim]")
         return
+    if policy.active:
+        found = ", ".join(
+            f"{label} ({v['cells']} cells)" for label, v in mask_report.findings.items()
+        ) or "nothing"
+        err_console.print(f"[dim]masking {policy.mode}: {found}[/dim]")
     if format == "table":
         render_table(console, columns, rows)
         console.print(f"[dim]{len(rows)} row{'s' if len(rows) != 1 else ''}[/dim]")

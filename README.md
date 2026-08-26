@@ -740,6 +740,123 @@ Annotations are **unenforced assertions**: nothing checks that
 `ANALYTICS.FCT_REVENUE` still exists, so a rename silently drops its
 annotation and the deprecated twin keeps looking clean.
 
+### Read-only sessions
+
+A user *or the agent itself* can give up write access for the rest of a
+session, and it cannot be taken back:
+
+```bash
+lakesh exec -p pg --read-only -q '...'   # this invocation
+lakesh run  -p pg --read-only            # this REPL sitting (also \readonly)
+lakesh mcp  --read-only                  # every call this server serves
+```
+
+or `LAKESH_READ_ONLY=1`, or `read_only = true` on a profile. Over MCP the
+agent can call `set_read_only()` itself, and `session_status()` reports
+what is currently in force.
+
+Two layers, and they only ever tighten. **Operator policy** — the profile
+key, the env var, `lakesh mcp --read-only` — and **caller narrowing** —
+the CLI flag, `\readonly`, `set_read_only()`, `query(read_only=True)`.
+Precedence is boolean OR: a layer may add a restriction, never subtract
+one, and `LAKESH_MCP_WRITE` stays subordinate to both. There is no API to
+relax a restriction, which is what makes "cannot be relaxed" true rather
+than merely intended.
+
+Refusals name the verb and the layer, because a caller told only
+"blocked" retries uselessly:
+
+```jsonc
+{"error": "write rejected: this statement contains `DROP` and the session is
+           read-only. The restriction comes from the operator's config
+           (profile 'pg' read_only) and cannot be relaxed from here …",
+ "error_type": "read_only_blocked", "blocked": "DROP",
+ "restriction": {"source": "policy", "relaxable": false}}
+```
+
+When a restriction is in force the write check is the stronger one, which
+also catches a write smuggled inside a CTE or after a semicolon —
+`WITH x AS (INSERT …) SELECT * FROM x` and `SELECT 1; DROP TABLE t` both
+pass the leading-keyword check that guards writes otherwise. `ATTACH`,
+`COPY` and `INSTALL` count as writes: a read-only session that can attach
+a writable database is not read-only in any useful sense.
+
+**Two honest limits.** Read-only is not a sandbox — `SELECT * FROM
+read_csv('/etc/passwd')` is a read, and DuckDB can reach the filesystem
+and HTTP from inside a SELECT. And an agent able to spawn a *second*
+`lakesh mcp` gets a fresh session, exactly as Snowflake's equivalent
+feature documents. Caller narrowing is a guardrail; only the policy layer
+travels to every spawn.
+
+### Hiding sensitive data
+
+```bash
+lakesh exec -p pg --mask mask  -q 'SELECT * FROM app.customers LIMIT 5'
+lakesh exec -p pg --mask audit -q '...'     # report, don't mask
+```
+
+```toml
+[masking]
+mode  = "mask"                      # off | mask | audit
+rules = ["pii.email", "pii.phone"]  # override the default-on set
+```
+
+Also `LAKESH_MASK=mask`, a per-profile `[profiles.X.masking]`, the MCP
+`query(mask="mask")` parameter, and `set_masking()` for the agent to
+latch it. Like read-only it only tightens: `audit` returns unmasked rows,
+so it is *weaker* than `mask` and cannot be reached from it.
+
+Masked values keep the shape of their type — `***masked***` for strings,
+`0` for integers, `0.00` for decimals (scale preserved), `9999-12-31` for
+dates. The type comes from the **value**, not the column's declared type,
+because Postgres `numeric(10,2)` arrives as a `DECIMAL` through the
+attached catalog and as a string through native ADBC.
+
+#### What it will and won't catch
+
+Detection is by value pattern first and column name second, because
+`SELECT email AS x` renames the output column and defeats a name rule
+outright — while the value rule still fires.
+
+| Rule | Default | |
+|---|---|---|
+| `pii.email` | on | |
+| `pii.ssn` | on | reserved ranges excluded |
+| `pii.credit_card` | on | **Luhn-checked** |
+| `pii.iban` | on | **mod-97 checked** |
+| `pii.phone` | on | separators required |
+| `pii.name`, `pii.address`, `pii.date_of_birth` | on | column name only — no value pattern for these is honest |
+| `pii.ip` | **off** | collides with version strings |
+
+The checksums and the separator requirement are not fussiness. Without
+them a naive set masks an ISO date, a build number, an IP address and a
+16-digit order number as "phone", and any long digit run as a card — and
+a masking feature that eats legitimate results gets switched off, after
+which it protects nothing. `pii.ip` ships off because `8.5.0.1` is
+simultaneously a valid address and an ordinary version string; only you
+know which your data holds. Use `--mask audit` to find out what *would*
+be masked before turning it on.
+
+#### What masking is not
+
+> lakesh masking removes recognisable PII from values **as they are
+> rendered**. It defends against *incidental exposure* — an agent that
+> `SELECT *`s a table and pulls a column it never needed into a model's
+> context. It is **not access control**.
+>
+> Anything the SQL does to a value before lakesh sees it defeats it:
+> `substr(email,1,5)` returns an unmatched fragment; `count(*) … WHERE
+> email LIKE 'a%'` leaks through the count; `md5(ssn)` yields a stable
+> re-identification key; `ORDER BY email` leaks through the ordering.
+>
+> If a caller **must not be able to read** a column, enforce it where the
+> data lives — a Snowflake or duckicelake masking policy, or a view that
+> never selects it.
+
+Findings are labelled `pii.email` / `pii.phone`, the same `{namespace}.{name}`
+tag shape [duckicelake](https://github.com/KellerKev/duckicelake) uses, so
+an `audit` report can be fed to its object-tags endpoint unchanged.
+
 ### Credentials never reach the model
 
 For Snowflake and Postgres profiles the connection URI *is* the

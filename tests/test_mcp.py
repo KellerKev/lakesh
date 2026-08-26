@@ -1046,3 +1046,106 @@ def test_reads_are_untouched_by_a_restriction(adbc_config, fake_native):
     out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow"))
     assert "error" not in out
     assert fake_native.statements == ["SELECT 1"]
+
+
+# --------------------------------------------------------------------------
+# masking through the tools
+
+
+@pytest.fixture(autouse=True)
+def _fresh_session_mask():
+    lakesh_mcp._SESSION_MASK["mode"] = "off"
+    yield
+    lakesh_mcp._SESSION_MASK["mode"] = "off"
+
+
+@pytest.fixture
+def pii_native(monkeypatch):
+    con = _FakeNativeConnection(
+        columns=("email", "note"),
+        rows=[("a@corp.com", "ref 12"), ("b@corp.com", "ref 13")],
+    )
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    return con
+
+
+def test_query_masks_json_output(adbc_config, pii_native):
+    out = json.loads(lakesh_mcp.query("SELECT email, note FROM t",
+                                      profile="snow", mask="mask"))
+    assert out["rows"][0]["email"] == "***masked***"
+    assert out["rows"][0]["note"] == "ref 12"          # not PII, untouched
+    assert out["masking"]["findings"]["pii.email"]["cells"] == 2
+    assert "not access control" in out["masking"]["note"]
+
+
+def test_query_masks_table_format_too(adbc_config, pii_native):
+    """`render_json` and the text table are separate paths; masking at the
+    fetch is what makes one test enough for both."""
+    txt = lakesh_mcp.query("SELECT email, note FROM t", profile="snow",
+                           mask="mask", format="table")
+    assert "a@corp.com" not in txt
+    assert "***masked***" in txt
+
+
+def test_audit_reports_without_masking(adbc_config, pii_native):
+    out = json.loads(lakesh_mcp.query("SELECT email, note FROM t",
+                                      profile="snow", mask="audit"))
+    assert out["rows"][0]["email"] == "a@corp.com"
+    assert out["masking"]["mode"] == "audit"
+    assert "pii.email" in out["masking"]["findings"]
+
+
+def test_set_masking_latches_and_cannot_be_relaxed(adbc_config, pii_native):
+    """`audit` returns unmasked rows, so it must not be reachable from
+    `mask` — otherwise it is an unmask switch."""
+    lakesh_mcp.set_masking()
+    for requested in ("audit", "off", None):
+        out = json.loads(lakesh_mcp.query("SELECT email, note FROM t",
+                                          profile="snow", mask=requested))
+        assert out["rows"][0]["email"] == "***masked***"
+        assert out["masking"]["mode"] == "mask"
+
+
+def test_config_masking_cannot_be_weakened_by_a_caller(tmp_path, monkeypatch, pii_native):
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "snow"
+
+[masking]
+mode = "mask"
+
+[profiles.snow]
+type   = "adbc"
+driver = "/x/libadbc_driver_snowflake.so"
+uri    = "user@ACCOUNT"
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    out = json.loads(lakesh_mcp.query("SELECT email, note FROM t", mask="audit"))
+    assert out["rows"][0]["email"] == "***masked***"
+    assert out["masking"]["mode"] == "mask"
+
+
+def test_masking_is_off_unless_asked_for(adbc_config, pii_native):
+    out = json.loads(lakesh_mcp.query("SELECT email, note FROM t", profile="snow"))
+    assert out["rows"][0]["email"] == "a@corp.com"
+    assert "masking" not in out
+
+
+def test_explain_plan_is_masked(adbc_config, monkeypatch):
+    """Plans embed filter literals, so this leaks the value without
+    masking."""
+    con = _FakeNativeConnection(
+        columns=("plan",),
+        rows=[("SEQ_SCAN users Filters: (email = 'alice@corp.com')",)],
+    )
+    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    out = json.loads(lakesh_mcp.query(
+        "SELECT * FROM users", profile="snow", estimate=True, mask="mask"))
+    assert "alice@corp.com" not in json.dumps(out)
+
+
+def test_session_status_reports_masking(adbc_config):
+    assert json.loads(lakesh_mcp.session_status())["masking"]["mode"] == "off"
+    lakesh_mcp.set_masking()
+    status = json.loads(lakesh_mcp.session_status())
+    assert status["masking"] == {"mode": "mask", "relaxable": False}

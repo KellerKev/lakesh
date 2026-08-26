@@ -137,6 +137,13 @@ TABLE_STATUSES = ("canonical", "deprecated", "unknown")
 # written before those existed will be parsing.
 DESCRIBE_TABLE_SHAPES = ("object", "array")
 
+# Masking modes. `audit` reports what would be masked without masking it,
+# which is the only way to tune a rule set without discovering in
+# production that it eats your order numbers.
+MASK_MODES = ("off", "mask", "audit")
+
+_MASKING_KEYS = frozenset({"mode", "rules"})
+
 _ANNOTATION_KEYS = frozenset({"status", "max_staleness", "note", "superseded_by"})
 
 _DURATION_RE = re.compile(r"(\d+)\s*([smhdw])", re.IGNORECASE)
@@ -217,6 +224,9 @@ class Profile:
     without one of its own."""
     tables: dict[str, TableAnnotation] = field(default_factory=dict)
     """Per-table annotations, keyed by `SCHEMA.TABLE` (globs allowed)."""
+    masking_mode: str | None = None
+    masking_rules: tuple[str, ...] | None = None
+    """Per-profile masking override; None means "use the global setting"."""
     # shared
     s3: S3Config = field(default_factory=S3Config)
     oauth: OAuthConfig = field(default_factory=OAuthConfig)
@@ -343,6 +353,10 @@ class Config:
     profiles: dict[str, Profile]
     default: str | None = None
     source_path: Path | None = None
+    masking_mode: str = "off"
+    masking_rules: tuple[str, ...] | None = None
+    """Global masking default. See `lakesh.mask` for what masking does and,
+    more importantly, what it does not."""
     describe_table_shape: str = "object"
     """Output shape for the MCP `describe_table` tool.
 
@@ -445,6 +459,52 @@ def _parse_timeout(name: str, value: Any) -> float | None:
     return seconds
 
 
+def parse_masking(raw: Any, where: str) -> tuple[str, tuple[str, ...] | None]:
+    """(mode, rule labels or None) from a `[masking]` table.
+
+    Unknown keys are rejected for the same reason table annotations reject
+    them: for a governance feature a silently-ignored typo is the worst
+    possible failure, because the operator believes the protection is on.
+    A `rules` entry naming a rule that does not exist is rejected too — a
+    rule you thought you enabled and didn't is the same failure.
+    """
+    from .mask import rule_index
+
+    if raw is None:
+        return "off", None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: `masking` must be a table")
+    unknown = sorted(set(raw) - _MASKING_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"{where}: unknown masking key{'s' if len(unknown) > 1 else ''} "
+            f"{', '.join(repr(u) for u in unknown)} "
+            f"(supported: {', '.join(sorted(_MASKING_KEYS))})"
+        )
+    mode = str(raw.get("mode", "off"))
+    if mode not in MASK_MODES:
+        raise ConfigError(
+            f"{where}: unknown masking mode {mode!r} "
+            f"(supported: {', '.join(MASK_MODES)})"
+        )
+    labels = raw.get("rules")
+    if labels is None:
+        return mode, None
+    if not isinstance(labels, list):
+        raise ConfigError(f"{where}: `masking.rules` must be a list of labels")
+    known = rule_index()
+    out = []
+    for label in labels:
+        name = str(label)
+        if name not in known:
+            raise ConfigError(
+                f"{where}: unknown masking rule {name!r} "
+                f"(available: {', '.join(sorted(known))})"
+            )
+        out.append(name)
+    return mode, tuple(out)
+
+
 def _parse_table_annotation(profile: str, key: str, raw: Any) -> TableAnnotation:
     """One `[profiles.X.tables]` entry.
 
@@ -540,6 +600,11 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         for key, value in tables_raw.items()
     }
     profile_staleness = str(raw.get("max_staleness", ""))
+    if "masking" in raw:
+        prof_mask_mode, prof_mask_rules = parse_masking(
+            raw.get("masking"), f"profile {name!r}")
+    else:
+        prof_mask_mode, prof_mask_rules = None, None
     p = Profile(
         name=name,
         type=ptype,
@@ -560,6 +625,8 @@ def _parse_profile(name: str, raw: dict) -> Profile:
             if profile_staleness else None
         ),
         tables=tables,
+        masking_mode=prof_mask_mode,
+        masking_rules=prof_mask_rules,
         s3=s3,
         oauth=oauth,
     )
@@ -599,9 +666,12 @@ def load_config(path: Path | None = None) -> Config:
             f"(supported: {', '.join(DESCRIBE_TABLE_SHAPES)})"
         )
 
+    mask_mode, mask_rules = parse_masking(data.get("masking"), str(path))
+
     return Config(
         profiles=profiles, default=default, source_path=path,
         describe_table_shape=shape,
+        masking_mode=mask_mode, masking_rules=mask_rules,
     )
 
 
@@ -617,6 +687,15 @@ _EXAMPLE = """\
 # `default` below.
 
 default = "local"
+
+# Masking: hide recognisable PII in results. "audit" reports what would
+# be masked without masking it — use it to tune the rule set before
+# turning masking on. Applies at RENDER time and is not access control:
+# substr(), LIKE filters, hashing and ORDER BY all defeat it.
+# [masking]
+# mode  = "off"                      # off | mask | audit
+# rules = ["pii.email", "pii.phone"] # override the default-on set
+
 
 # Output shape for the MCP `describe_table` tool: "object" (default)
 # wraps the columns alongside the table's status and freshness; "array"

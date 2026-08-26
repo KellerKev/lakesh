@@ -94,6 +94,7 @@ from .duck import (
 from . import freshness
 from .oauth import AuthRequired
 from . import guard
+from . import mask as _mask
 from .output import _stringify  # type: ignore[attr-defined]
 from .redact import profile_secrets, redact_uri, scrub
 
@@ -505,6 +506,27 @@ def session_status() -> str:
         "restriction": restriction.as_dict(),
         "summary": restriction.describe(),
         "writes_enabled_by_env": _writes_enabled(),
+        "masking": {"mode": _SESSION_MASK["mode"], "relaxable": False},
+    })
+
+
+_SESSION_MASK: dict[str, str] = {"mode": "off"}
+
+
+@server.tool()
+def set_masking() -> str:
+    """Mask recognisable PII in every result for the rest of this session.
+
+    Takes no argument, and cannot be turned off — including down to
+    `audit`, which returns unmasked rows. Read `query`'s note on what
+    masking does and does not protect against before relying on it.
+    """
+    _SESSION_MASK["mode"] = "mask"
+    return json.dumps({
+        "ok": True, "mode": "mask", "relaxable": False,
+        "note": ("Masking applies as values are rendered. It is not access "
+                 "control — SQL that transforms a value before lakesh sees "
+                 "it defeats it."),
     })
 
 
@@ -1034,10 +1056,11 @@ def search_objects(
 
 def _estimate_query(
     profile_name: str | None, prof: Profile, sql: str, mode: str,
-    want: str, timeout: float | None,
+    want: str, timeout: float | None, policy: "_mask.Policy | None" = None,
 ) -> str:
     """Size a statement up without running it (or, for `count`, without
     returning its rows)."""
+    policy = policy or _mask.Policy("off")
     out: dict[str, Any] = {"estimate": True, "mode": mode}
     native = mode == "native"
 
@@ -1099,9 +1122,11 @@ def _estimate_query(
         return json.dumps(out)
 
     out["method"] = "explain"
-    out["plan"] = "\n".join(
+    # Plans embed filter literals verbatim, so `EXPLAIN … WHERE
+    # email='alice@corp.com'` ships the value without this.
+    out["plan"] = _mask.mask_text(policy, "\n".join(
         str(cell) for row in rows for cell in row if cell is not None
-    )
+    ))
     if not native:
         # Parsed only where the shape is known and tested. Snowflake's
         # plan is passed through verbatim rather than guessed at.
@@ -1123,6 +1148,7 @@ def query(
     timeout_s: float | None = None,
     estimate: bool | str = False,
     read_only: bool = False,
+    mask: str | None = None,
 ) -> str:
     """Run a SQL statement and return its result.
 
@@ -1188,6 +1214,14 @@ def query(
                 session. When any restriction is in force the write check
                 is the stronger one, which also catches a write smuggled
                 inside a CTE or after a `;`.
+        mask: `"mask"` to replace recognisable PII in the results, or
+                `"audit"` to report what would be masked without masking
+                it. Narrows only — it cannot weaken masking the operator
+                configured. Masking applies as values are RENDERED and is
+                not access control: `substr(email,1,5)`, `count(*) WHERE
+                email LIKE 'a%'`, `md5(ssn)` and `ORDER BY email` all
+                defeat it. Use it to avoid pulling PII you don't need into
+                context, not to enforce that you cannot read it.
 
     Writes (INSERT / UPDATE / DELETE / DDL / DROP) are rejected unless
     the server was started with `LAKESH_MCP_WRITE=1` in its environment.
@@ -1223,6 +1257,10 @@ def query(
     # deliberately does not latch, because a routine parameter quietly
     # restricting the rest of the session would surprise the caller.
     # `set_read_only()` is the latch.
+    policy = _mask.resolve(
+        _load_or_raise(), prof, requested=mask,
+        session_mode=_SESSION_MASK["mode"],
+    )
     restriction = guard.SESSION.effective(prof)
     if read_only and not restriction.read_only:
         restriction = guard.Restriction(True, guard.USER, "query(read_only=True)")
@@ -1259,7 +1297,7 @@ def query(
                 "error": "estimate and offset are mutually exclusive — an "
                          "estimate describes the whole statement, not a page.",
             })
-        return _estimate_query(profile, prof, sql, mode, want_estimate, timeout)
+        return _estimate_query(profile, prof, sql, mode, want_estimate, timeout, policy)
     # A hard deadline needs DuckDB to be the one blocked. In native mode
     # the statement sits inside the driver, which does not observe the
     # interrupt until it returns.
@@ -1308,6 +1346,7 @@ def query(
 
     has_more = len(rows) > limit
     rows = rows[:limit]
+    rows, mask_report = _mask.mask_rows(policy, columns, rows)
     warnings: list[str] = []
     if offset and not _HAS_ORDER_BY.search(sql):
         warnings.append(
@@ -1334,6 +1373,9 @@ def query(
             payload["offset"] = offset
         if warnings:
             payload["warnings"] = warnings
+        masking = mask_report.as_dict(policy)
+        if masking:
+            payload["masking"] = masking
         return json.dumps(payload, default=str)
     footer = f"\n\n({len(rows)} rows, mode={mode}"
     if has_more:

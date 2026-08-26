@@ -808,3 +808,110 @@ uri    = "postgresql://u@h/db"
     with pytest.raises(ConfigError) as e:
         load_config(p)
     assert "tuple" in str(e.value) and "object, array" in str(e.value)
+
+
+# --------------------------------------------------------------------------
+# masking config
+
+
+def test_masking_parses(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+default = "pg"
+
+[masking]
+mode  = "mask"
+rules = ["pii.email", "pii.ip"]
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+"""))
+    assert cfg.masking_mode == "mask"
+    assert cfg.masking_rules == ("pii.email", "pii.ip")
+
+
+def test_masking_defaults_to_off(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+default = "pg"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+"""))
+    assert cfg.masking_mode == "off"
+    assert cfg.masking_rules is None
+
+
+def test_unknown_masking_key_is_rejected(tmp_path):
+    """Same reasoning as the table-annotation guard: for a governance
+    feature a silently-ignored typo is the worst failure, because the
+    operator believes the protection is on."""
+    with pytest.raises(ConfigError) as e:
+        load_config(_write(tmp_path, """
+default = "pg"
+
+[masking]
+mode  = "mask"
+ruels = ["pii.email"]
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+"""))
+    assert "ruels" in str(e.value)
+
+
+def test_unknown_masking_mode_is_rejected(tmp_path):
+    with pytest.raises(ConfigError) as e:
+        load_config(_write(tmp_path, """
+default = "pg"
+
+[masking]
+mode = "redact"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+"""))
+    assert "redact" in str(e.value) and "off, mask, audit" in str(e.value)
+
+
+def test_unknown_rule_label_is_rejected(tmp_path):
+    """A rule you thought you enabled and didn't is the same failure as a
+    typo'd key."""
+    with pytest.raises(ConfigError) as e:
+        load_config(_write(tmp_path, """
+default = "pg"
+
+[masking]
+rules = ["pii.emai"]
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+"""))
+    assert "pii.emai" in str(e.value)
+
+
+def test_profile_masking_overrides_global(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+default = "pg"
+
+[masking]
+mode = "audit"
+
+[profiles.pg]
+type   = "adbc"
+driver = "postgresql"
+uri    = "postgresql://u@h/db"
+
+[profiles.pg.masking]
+mode = "mask"
+"""))
+    assert cfg.masking_mode == "audit"
+    assert cfg.get("pg").masking_mode == "mask"
