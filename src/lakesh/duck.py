@@ -32,6 +32,7 @@ same pattern as any other `httpfs` consumer.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import threading
@@ -88,6 +89,17 @@ def _install_s3_secret(con: duckdb.DuckDBPyConnection, profile: Profile) -> None
 # adbc_scanner — query anything with an ADBC driver
 
 _adbc_warned = False   # warn once per process, not per MCP tool call
+
+# Set once at startup by the CLI. A module global rather than a
+# parameter because `connect()` has three return sites and the builders
+# are also reached through the OAuth retry path; a flag that has to be
+# passed is a flag that gets missed on one of them.
+ALLOW_LOCAL_FILES = False
+
+# Why the sandbox was skipped on the most recent connection, for
+# `session_status` to report. A sandbox you believe is on but isn't is
+# worse than no sandbox.
+LAST_SANDBOX_SKIP: str | None = None
 
 
 def load_adbc_scanner(con: duckdb.DuckDBPyConnection, *, required: bool = False) -> bool:
@@ -198,6 +210,7 @@ def _connect_adbc(profile: Profile, token: str | None) -> duckdb.DuckDBPyConnect
     secret_opts, attach_opts = _split_adbc_options(_adbc_options(profile, token))
     _install_adbc_secret(con, profile, secret_opts)
     con.execute(_adbc_attach_sql(profile, attach_opts))
+    _sandbox(con, profile)
     return con
 
 
@@ -262,6 +275,137 @@ def adbc_native_scan(
     statement rides as a bound parameter, so the source's own dialect
     applies and DuckDB never parses it."""
     return con.execute("SELECT * FROM adbc_scan(?, ?)", [handle, sql])
+
+
+# --------------------------------------------------------------------------
+# filesystem sandbox
+#
+# A read-only session is not a sandbox on its own: `SELECT * FROM
+# read_csv('/etc/passwd')` is a read, so the write gate lets it through
+# and DuckDB happily reaches the local disk from inside a SELECT.
+#
+# `SET disabled_filesystems='LocalFileSystem'` closes that, and DuckDB
+# makes it **self-locking** — measured: attempting to clear it in the
+# same process is refused by DuckDB itself with "has been disabled
+# previously, it cannot be added again". That is a stronger guarantee
+# than anything lakesh could enforce, because it also binds caller SQL.
+#
+# Measured against DuckDB 1.5.2, with extensions already loaded:
+#
+#   read_text / read_csv / sniff_csv / glob   Permission Error
+#   an existing ADBC handle                   still works
+#   a NEW adbc_connect with a driver .so      still works (the ADBC
+#                                             manager dlopens it, outside
+#                                             DuckDB's filesystem layer)
+#   HTTP / S3 through httpfs                  still works — an HTTP read
+#                                             fails with a network error,
+#                                             not a permission error
+#   local Parquet                             blocked (intended)
+#   INSTALL / LOAD                            blocked
+#
+# That last row is the ordering constraint: extension loading reads the
+# local extension directory, so the lockdown has to come after every
+# INSTALL/LOAD/ATTACH — which is why it is applied at the tail of each
+# builder rather than anywhere earlier.
+#
+# Two alternatives were measured and rejected. `enable_external_access =
+# false` also blocks HTTP/S3, which would break every Iceberg and
+# DuckLake profile. `allowed_directories` does not combine with
+# `disabled_filesystems` — the disabled filesystem wins and the allowed
+# directory is blocked anyway — so local and remote access are mutually
+# exclusive under lockdown rather than tunable.
+#
+# Scope, stated plainly: this stops lakesh's own engine reading your
+# disk. It does nothing about what a remote source can do, and DuckDB's
+# own documentation calls these defence-in-depth rather than a complete
+# boundary against untrusted SQL.
+
+_REMOTE_SCHEMES = ("s3://", "gs://", "gcs://", "az://", "azure://",
+                   "abfss://", "r2://", "http://", "https://")
+
+
+def needs_local_files(profile: Profile) -> str | None:
+    """Why this profile cannot be sandboxed, or None if it can.
+
+    A DuckLake `data_path` or an Iceberg warehouse on a local path means
+    every data read goes through the local filesystem. Locking it would
+    produce a session that connects cleanly and then fails on every
+    query, which is worse than not sandboxing — so detect it and say so.
+    """
+    def _is_local(value: str) -> bool:
+        return bool(value) and not value.startswith(_REMOTE_SCHEMES)
+
+    if profile.type == "ducklake" and _is_local(profile.data_path):
+        return (f"profile {profile.name!r} reads DuckLake data from a local "
+                f"path ({profile.data_path!r})")
+    if profile.type == "iceberg-rest" and _is_local(profile.warehouse) and "/" in profile.warehouse:
+        return (f"profile {profile.name!r} has a local Iceberg warehouse "
+                f"({profile.warehouse!r})")
+    return None
+
+
+def sandbox_wanted(profile: Profile) -> bool:
+    """Sandbox when the session is read-only and local files weren't
+    explicitly asked for. Tying it to read-only rather than a separate
+    flag is deliberate: a read-only session is one where the caller has
+    said they are only looking, so losing local-file reads costs little
+    and closes the hole exactly where it matters."""
+    from . import guard
+
+    if ALLOW_LOCAL_FILES or os.environ.get(
+            "LAKESH_ALLOW_LOCAL_FILES", "0").lower() in ("1", "true", "yes"):
+        return False
+    return guard.SESSION.effective(profile).read_only
+
+
+def _sandbox(con: duckdb.DuckDBPyConnection, profile: Profile) -> None:
+    """Apply the sandbox if this session wants one, recording any skip."""
+    global LAST_SANDBOX_SKIP
+    if not sandbox_wanted(profile):
+        LAST_SANDBOX_SKIP = None
+        return
+    LAST_SANDBOX_SKIP = apply_sandbox(con, profile)
+
+
+def apply_sandbox(
+    con: duckdb.DuckDBPyConnection, profile: Profile
+) -> str | None:
+    """Block local filesystem access on `con`. Returns the reason it was
+    skipped, or None when it was applied.
+
+    Must be called after every INSTALL/LOAD/ATTACH; see the note above.
+    """
+    reason = needs_local_files(profile)
+    if reason:
+        return reason
+    try:
+        con.execute("SET disabled_filesystems='LocalFileSystem'")
+    except duckdb.Error as e:                       # pragma: no cover
+        return f"DuckDB refused the sandbox setting: {e}"
+    return None
+
+
+# Raised when caller SQL trips the sandbox — including indirectly, via
+# DuckDB trying to autoload an extension it needs, which reads the local
+# extension directory. The raw error mentions only the filesystem, which
+# reads like a bug rather than a policy.
+_SANDBOX_ERROR_RE = re.compile(
+    r"File system LocalFileSystem has been disabled|"
+    r"disabled by configuration",
+    re.IGNORECASE,
+)
+
+
+def explain_sandbox_error(exc: Exception) -> str | None:
+    """A hint for an error caused by the sandbox, or None."""
+    if not _SANDBOX_ERROR_RE.search(str(exc)):
+        return None
+    return (
+        "this session blocks local filesystem access because it is "
+        "read-only. Local files, and any DuckDB extension not already "
+        "loaded, are unreachable. Re-run with --allow-local-files if you "
+        "need them."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -425,6 +569,7 @@ def connect_native(
         con.close()
         raise
     arm_driver_timeout(con, handle, profile, timeout_s)
+    _sandbox(con, profile)
     return con, handle
 
 
@@ -451,6 +596,7 @@ def _connect_iceberg_rest(profile: Profile, token: str | None) -> duckdb.DuckDBP
         f"  ACCESS_DELEGATION_MODE 'none'"
         f")"
     )
+    _sandbox(con, profile)
     return con
 
 
@@ -475,6 +621,7 @@ def _connect_ducklake(profile: Profile) -> duckdb.DuckDBPyConnection:
         f"ATTACH '{uri}' AS {profile.catalog} "
         f"(DATA_PATH '{profile.data_path}', DATA_INLINING_ROW_LIMIT 0)"
     )
+    _sandbox(con, profile)
     return con
 
 

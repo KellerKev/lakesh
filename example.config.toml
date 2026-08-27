@@ -11,6 +11,17 @@ default = "local"
 # mode  = "off"                      # off | mask | audit
 # rules = ["pii.email", "pii.phone"] # override the default-on set
 
+# Your own masking patterns. Needs: pip install 'lakesh[mask]'
+# Compiled with RE2, which cannot backtrack — so an untrusted pattern
+# can't hang the server. RE2 has no lookaround or backreferences; a
+# pattern using them is refused rather than downgraded to `re`.
+# `requires` is a literal the pattern cannot match without, which lets
+# the scanner skip cells that cannot possibly match.
+# [masking.custom."pii.employee_id"]
+# value    = 'EMP-[0-9]{6}'
+# requires = "EMP-"
+
+
 
 # Output shape for the MCP `describe_table` tool: "object" (default)
 # wraps the columns alongside the table's status and freshness; "array"

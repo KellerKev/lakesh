@@ -305,3 +305,143 @@ def test_mask_text_covers_plan_and_error_strings():
     assert "SEQ_SCAN users" in out
     # audit mode reports but does not alter
     assert mask_text(_policy("audit"), plan) == plan
+
+
+# --------------------------------------------------------------------------
+# custom rules
+#
+# A user pattern is untrusted input, so it is compiled with RE2, which
+# cannot backtrack. The shipped rules stay on `re` because they need
+# lookarounds — RE2 has none — and they are a fixed, audited set.
+
+
+import pytest as _pytest
+
+from lakesh.mask import CustomRuleError, build_custom_rules, compile_custom
+
+re2 = _pytest.importorskip("re2", reason="google-re2 not installed")
+
+
+def test_custom_rule_masks_a_company_identifier():
+    rules = build_custom_rules(
+        {"pii.employee_id": {"value": "EMP-[0-9]{6}", "requires": "EMP-"}})
+    policy = Policy("mask", rules, "test")
+    masked, report = mask_rows(policy, ["badge"], [("EMP-123456",), ("ORD-99",)])
+    assert masked[0][0] == MASKED
+    assert masked[1][0] == "ORD-99"
+    assert "pii.employee_id" in report.findings
+
+
+def test_re2_runs_the_redos_classic_in_linear_time():
+    """`(a+)+$` is the textbook catastrophic-backtracking pattern. RE2
+    does not reject it — it just cannot backtrack, so it runs fast. This
+    is the whole reason custom patterns use RE2 rather than a timeout."""
+    pattern = compile_custom("pii.x", r"(a+)+$")
+    start = time.perf_counter()
+    pattern.search("a" * 40 + "b")
+    assert (time.perf_counter() - start) < 0.5
+
+
+@_pytest.mark.parametrize("pattern,feature", [
+    (r"(?<!\d)\d{3}", "lookbehind"),
+    (r"foo(?!bar)", "negative lookahead"),
+    (r"(a)\1", "backreference"),
+])
+def test_patterns_re2_cannot_compile_are_refused_not_downgraded(pattern, feature):
+    """Never fall back to `re`. The fallback is the entire risk: it hands
+    `re` precisely the patterns RE2 found too dangerous to compile."""
+    with _pytest.raises(CustomRuleError) as e:
+        compile_custom("pii.x", pattern)
+    assert "RE2" in str(e.value)
+
+
+def test_missing_re2_refuses_rather_than_silently_skipping(monkeypatch):
+    import builtins
+    real = builtins.__import__
+
+    def _no_re2(name, *a, **k):
+        if name == "re2":
+            raise ImportError("no re2")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_re2)
+    with _pytest.raises(CustomRuleError) as e:
+        compile_custom("pii.x", "abc")
+    assert "google-re2" in str(e.value) and "pip install" in str(e.value)
+
+
+@_pytest.mark.parametrize("spec,expect", [
+    ({"pii.x": {"value": "abc"}}, "requires"),
+    ({"PII.X": {"value": "abc", "requires": "a"}}, "lowercase"),
+    ({"pii": {"value": "abc", "requires": "a"}}, "lowercase"),
+    ({"pii.x": {"valu": "abc"}}, "unknown key"),
+    ({"pii.x": {}}, "matches nothing"),
+    ({"pii.x": "not-a-table"}, "must be a table"),
+])
+def test_custom_rules_fail_closed(spec, expect):
+    """An unusable rule stops the config loading rather than quietly not
+    protecting anything."""
+    with _pytest.raises(CustomRuleError) as e:
+        build_custom_rules(spec)
+    assert expect in str(e.value)
+
+
+def test_requires_is_mandatory_and_explains_itself():
+    with _pytest.raises(CustomRuleError) as e:
+        build_custom_rules({"pii.x": {"value": "abc"}})
+    assert "cannot match without" in str(e.value)
+
+
+def test_column_only_custom_rule_needs_no_requires():
+    rules = build_custom_rules({"pii.badge": {"column": "^badge$"}})
+    policy = Policy("mask", rules, "t")
+    masked, _ = mask_rows(policy, ["badge"], [("anything",)])
+    assert masked[0][0] == MASKED
+
+
+# --------------------------------------------------------------------------
+# defeat detection
+#
+# Heuristic by construction: it warns, never refuses. Refusing would
+# block honest queries while still missing a determined caller.
+
+
+from lakesh.mask import detect_defeats
+
+
+@_pytest.mark.parametrize("sql,where", [
+    ("SELECT substr(email,1,5) FROM t", "function call"),
+    ("SELECT md5(ssn) FROM t", "function call"),
+    ("SELECT count(*) FROM t WHERE email LIKE 'a%'", "LIKE"),
+    ("SELECT id FROM t ORDER BY email", "ORDER BY"),
+    ("SELECT upper(first_name) FROM t", "function call"),
+])
+def test_defeats_are_flagged(sql, where):
+    warnings = detect_defeats(_policy(), sql)
+    assert warnings and where in warnings[0]
+
+
+@_pytest.mark.parametrize("sql", [
+    "SELECT email FROM t",
+    "SELECT sum(amount) FROM orders GROUP BY region",
+    "SELECT * FROM customers",
+])
+def test_ordinary_queries_are_not_flagged(sql):
+    assert detect_defeats(_policy(), sql) == []
+
+
+def test_a_column_name_inside_a_string_literal_is_not_flagged():
+    """Reuses guard.strip_literals, so `note = 'substr(email'` is text,
+    not a transformation."""
+    assert detect_defeats(_policy(), "SELECT * FROM t WHERE note = 'substr(email'") == []
+
+
+def test_no_warnings_when_masking_is_off():
+    assert detect_defeats(Policy("off"), "SELECT substr(email,1,5) FROM t") == []
+    assert detect_defeats(_policy("audit"), "SELECT substr(email,1,5) FROM t") == []
+
+
+def test_each_column_is_warned_about_once():
+    """A wide query must not bury the response in duplicates."""
+    sql = "SELECT substr(email,1,2), upper(email), lower(email) FROM t ORDER BY email"
+    assert len(detect_defeats(_policy(), sql)) == 1

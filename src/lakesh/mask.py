@@ -82,6 +82,60 @@ MAX_SCAN_CHARS = 4096
 
 
 # --------------------------------------------------------------------------
+# custom rules
+#
+# A user-supplied pattern is untrusted input, and `re` can be made to
+# backtrack for an unbounded time by a pattern as short as `(a+)+$`.
+# Measured: 26 characters of input takes 3 seconds, 32 hangs the
+# interpreter indefinitely — and a `threading.Timer` cannot stop it,
+# because the matching thread holds the GIL and starves the watchdog.
+#
+# So custom patterns are compiled with RE2 instead, which builds a DFA
+# and cannot backtrack at all. It runs the same `(a+)+$` against 40
+# characters in 0.06ms. That removes the vulnerability class rather than
+# bounding its damage, needs no timeout to tune, and works on Windows.
+#
+# The price is that RE2 has no lookaround and no backreferences —
+# verified, it refuses `(?<!\d)`, `(?!bar)` and `\1`. The shipped rules
+# below use lookarounds heavily, so they stay on `re`: they are a fixed,
+# audited set with a test asserting every one of them is bounded. Only
+# the untrusted half gets the untrusted-input engine.
+#
+# lakesh never falls back to `re` for a pattern RE2 rejects. That
+# fallback is the whole risk — it would hand `re` precisely the patterns
+# RE2 found too dangerous to compile.
+
+
+class CustomRuleError(Exception):
+    """A custom masking pattern that cannot be accepted."""
+
+
+def compile_custom(label: str, pattern: str):
+    """Compile a user-supplied pattern with RE2.
+
+    Raises `CustomRuleError` if google-re2 is not installed or if RE2
+    will not compile the pattern — never silently falls back to `re`.
+    """
+    try:
+        import re2
+    except ImportError:
+        raise CustomRuleError(
+            f"custom masking rule {label!r} needs the google-re2 package, "
+            f"which guarantees the pattern cannot hang the server: "
+            f"pip install 'lakesh[mask]' (or pip install google-re2)"
+        ) from None
+    try:
+        return re2.compile(pattern)
+    except Exception as e:
+        raise CustomRuleError(
+            f"custom masking rule {label!r}: RE2 will not compile "
+            f"{pattern!r} ({e}). RE2 has no lookaround or backreferences — "
+            f"that is the price of a pattern that cannot backtrack. "
+            f"Rewrite it without them."
+        ) from None
+
+
+# --------------------------------------------------------------------------
 # verifiers — the difference between a usable rule and a noisy one
 
 def luhn(text: str) -> bool:
@@ -477,9 +531,131 @@ def resolve(cfg, prof=None, requested: str | None = None,
         return Policy("off", (), "")
     best_mode, source = max(candidates, key=lambda c: rank.get(c[0], 0))
 
-    index = rule_index()
+    custom = tuple(getattr(cfg, "masking_custom", ()) or ())
+    if prof is not None and getattr(prof, "masking_custom", ()):
+        custom = tuple(prof.masking_custom)
+    index = dict(rule_index())
+    index.update({r.label: r for r in custom})
     chosen = (
         tuple(index[l] for l in labels if l in index) if labels is not None
-        else tuple(r for r in DEFAULT_RULES if r.default_on)
+        # Custom rules are always on when defined: writing one down is
+        # the opt-in, unlike the shipped set where some ship off.
+        else tuple(r for r in DEFAULT_RULES if r.default_on) + custom
     )
     return Policy(best_mode, chosen, source)
+
+
+def build_custom_rules(raw: dict) -> tuple[Rule, ...]:
+    """`[masking.custom."pii.x"]` tables -> Rules, or raise.
+
+    Fail-closed on every count: an unusable rule must stop the config
+    loading rather than quietly not protecting anything.
+    """
+    out: list[Rule] = []
+    for label, spec in (raw or {}).items():
+        label = str(label)
+        if not LABEL_RE.match(label):
+            raise CustomRuleError(
+                f"custom masking rule {label!r}: labels are two-part and "
+                f"lowercase, e.g. 'pii.employee_id' — matching duckicelake's "
+                f"tag shape so findings can be exported to it unchanged"
+            )
+        if not isinstance(spec, dict):
+            raise CustomRuleError(
+                f"custom masking rule {label!r} must be a table, e.g. "
+                f"{{ value = '...', requires = '...' }}"
+            )
+        unknown = sorted(set(spec) - {"value", "column", "requires"})
+        if unknown:
+            raise CustomRuleError(
+                f"custom masking rule {label!r}: unknown key"
+                f"{'s' if len(unknown) > 1 else ''} "
+                f"{', '.join(repr(u) for u in unknown)} "
+                f"(supported: column, requires, value)"
+            )
+        value_src = spec.get("value")
+        column_src = spec.get("column")
+        if not value_src and not column_src:
+            raise CustomRuleError(
+                f"custom masking rule {label!r} needs a `value` pattern, a "
+                f"`column` pattern, or both — otherwise it matches nothing"
+            )
+        requires = str(spec.get("requires", ""))
+        if value_src and not requires:
+            raise CustomRuleError(
+                f"custom masking rule {label!r}: `requires` is mandatory for "
+                f"a value pattern. It is a literal the pattern cannot match "
+                f"without, and it lets the scanner skip cells that cannot "
+                f"possibly match — the difference between masking being free "
+                f"and masking scanning every byte of every text column."
+            )
+        out.append(Rule(
+            label=label,
+            requires=requires,
+            value=compile_custom(label, str(value_src)) if value_src else None,
+            column=compile_custom(label, str(column_src)) if column_src else None,
+            whole_cell=not value_src,
+            why="custom rule",
+        ))
+    return tuple(out)
+
+
+# --------------------------------------------------------------------------
+# defeat detection
+#
+# Masking replaces values as they are RENDERED, so anything the SQL does
+# to a value first defeats it: `substr(email,1,5)` returns a fragment no
+# pattern recognises, `WHERE email LIKE 'a%'` leaks through the row
+# count, `md5(ssn)` yields a stable re-identification key, and
+# `ORDER BY email` leaks through the ordering.
+#
+# None of that can be fixed client-side — masking would have to happen
+# inside the engine, which needs a full SQL rewriter and is impossible on
+# the native path where lakesh never parses the statement.
+#
+# What CAN be done is make it visible. This is a heuristic and is
+# described as one: it is trivially evaded (`SUBSTRING` for `substr`,
+# `email || ''`), so it warns and never refuses. Refusing would block
+# honest queries while still missing a determined caller. The value is
+# that an accidental defeat shows up in the transcript instead of
+# silently returning unmasked data that looks masked.
+
+_DEFEAT_CONTEXTS = (
+    (re.compile(r"\b(\w+)\s*\(\s*([A-Za-z_][\w.]*)", re.I), "inside a function call"),
+    (re.compile(r"([A-Za-z_][\w.]*)\s+(?:not\s+)?i?like\b", re.I), "in a LIKE filter"),
+    (re.compile(r"\border\s+by\s+([A-Za-z_][\w.]*)", re.I), "in an ORDER BY"),
+    (re.compile(r"\bgroup\s+by\s+([A-Za-z_][\w.]*)", re.I), "in a GROUP BY"),
+)
+
+
+def detect_defeats(policy: Policy, sql: str) -> list[str]:
+    """Warnings for SQL that would render masking ineffective.
+
+    Heuristic by construction — see the note above. Returns at most one
+    warning per column so a wide query cannot bury the response.
+    """
+    if not policy.masks or not sql:
+        return []
+    from .guard import strip_literals
+
+    cleaned = strip_literals(sql)
+    named = [r for r in policy.rules if r.column is not None]
+    seen: dict[str, str] = {}
+    for pattern, where in _DEFEAT_CONTEXTS:
+        for found in pattern.finditer(cleaned):
+            # The function-call form captures (function, argument); the
+            # rest capture the column directly.
+            column = found.group(2) if found.re.groups > 1 else found.group(1)
+            bare = column.rsplit(".", 1)[-1]
+            if bare.lower() in seen:
+                continue
+            for rule in named:
+                if rule.column.search(bare):
+                    seen[bare.lower()] = (
+                        f"masking may not apply: `{bare}` appears {where} "
+                        f"({found.group().strip()[:40]!r}). Masking replaces "
+                        f"values as they are rendered, so a transformation "
+                        f"applied before rendering is not masked."
+                    )
+                    break
+    return list(seen.values())

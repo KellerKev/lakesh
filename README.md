@@ -781,9 +781,35 @@ pass the leading-keyword check that guards writes otherwise. `ATTACH`,
 `COPY` and `INSTALL` count as writes: a read-only session that can attach
 a writable database is not read-only in any useful sense.
 
-**Two honest limits.** Read-only is not a sandbox — `SELECT * FROM
-read_csv('/etc/passwd')` is a read, and DuckDB can reach the filesystem
-and HTTP from inside a SELECT. And an agent able to spawn a *second*
+#### Read-only also blocks local files
+
+`SELECT * FROM read_csv('/etc/passwd')` is a read, so the write gate
+alone would let it through. A read-only session therefore also applies
+`SET disabled_filesystems='LocalFileSystem'`, which blocks `read_csv`,
+`read_text`, `read_parquet` and `glob`. **DuckDB makes that setting
+self-locking** — caller SQL cannot turn it back on, which is a stronger
+guarantee than anything lakesh could enforce in Python.
+
+Measured, so you know what still works: an existing ADBC handle, a *new*
+`adbc_connect` (the driver `.so` is `dlopen`ed outside DuckDB's
+filesystem layer), and HTTP/S3 through httpfs — an HTTP read fails with a
+network error, not a permission error. What stops working is local
+files, including the local-Parquet join. Use `--allow-local-files` (or
+`LAKESH_ALLOW_LOCAL_FILES=1`) if you need them.
+
+Two cases skip the sandbox automatically and say so: a DuckLake profile
+whose `data_path` is a local directory, and an Iceberg warehouse on a
+local path. Locking those would produce a session that connects cleanly
+and then fails on every query, which is worse than not locking.
+
+**What it is not.** This stops lakesh's own engine reading your disk. It
+does nothing about what the remote source can do — a Snowflake query
+still runs with whatever that role can reach — and DuckDB's own
+[security docs](https://duckdb.org/docs/stable/operations_manual/securing_duckdb/overview)
+call these defence-in-depth rather than a complete boundary against
+untrusted SQL. For real isolation, run lakesh in a container.
+
+**One honest limit remains.** An agent able to spawn a *second*
 `lakesh mcp` gets a fresh session, exactly as Snowflake's equivalent
 feature documents. Caller narrowing is a guardrail; only the policy layer
 travels to every spawn.
@@ -852,6 +878,39 @@ be masked before turning it on.
 > If a caller **must not be able to read** a column, enforce it where the
 > data lives — a Snowflake or duckicelake masking policy, or a view that
 > never selects it.
+
+lakesh cannot close those holes — masking would have to happen inside the
+engine, which needs a full SQL rewriter and is impossible on the native
+path where the statement is never parsed. What it does instead is make
+them **visible**: when masking is active and a sensitive-looking column
+appears inside a function call, a `LIKE`, an `ORDER BY` or a `GROUP BY`,
+the response carries a warning saying masking may not have applied. That
+is a heuristic and is trivially evaded (`SUBSTRING` for `substr`,
+`email || ''`), so it warns and never refuses — refusing would block
+honest queries while still missing a determined caller.
+
+#### Your own patterns
+
+```toml
+[masking.custom."pii.employee_id"]
+value    = 'EMP-[0-9]{6}'
+requires = "EMP-"            # a literal the pattern cannot match without
+column   = '^emp(loyee)?_(id|no)$'
+```
+
+Needs `pip install 'lakesh[mask]'`. Custom patterns are compiled with
+**RE2**, not `re`: a user-supplied regex is untrusted input, and `re` can
+be made to backtrack indefinitely by a pattern as short as `(a+)+$` — 26
+characters of input takes 3 seconds, 32 hangs the interpreter, and a
+watchdog thread cannot stop it because the matching thread holds the GIL.
+RE2 compiles to a DFA and cannot backtrack at all; it runs that same
+pattern against 40 characters in 0.06ms.
+
+The price is that **RE2 has no lookaround or backreferences**, so custom
+patterns cannot use them. A pattern RE2 will not compile is refused with
+that as the reason — lakesh never falls back to `re`, because the
+fallback would hand `re` precisely the patterns RE2 found too dangerous.
+`requires` is mandatory for the same reason it is on the shipped rules.
 
 Findings are labelled `pii.email` / `pii.phone`, the same `{namespace}.{name}`
 tag shape [duckicelake](https://github.com/KellerKev/duckicelake) uses, so

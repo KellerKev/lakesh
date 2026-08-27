@@ -43,6 +43,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Custom masking rules only. User-supplied regexes are untrusted input,
+# and RE2 compiles to a DFA that cannot backtrack — so a pattern like
+# `(a+)+$`, which hangs `re` on 32 characters, runs in linear time. The
+# shipped rules need lookarounds (RE2 has none) and stay on `re`, so the
+# base install is unaffected.
+mask = ["google-re2"]
 dev = [
     "pytest>=8,<9",
     "pytest-asyncio>=0.23",

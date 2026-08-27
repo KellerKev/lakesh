@@ -21,6 +21,7 @@ from .config import (
     load_config,
     write_example_config,
 )
+from . import duck as _duck
 from .duck import adbc_native_scan, catalog_alias, connect, connect_native
 from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
@@ -96,10 +97,18 @@ def run(
         help="Refuse writes for this session. Cannot be undone once set — "
              "start a new session to regain write access.",
     ),
+    allow_local_files: bool = typer.Option(
+        False, "--allow-local-files",
+        help="Keep local filesystem access in a read-only session. Off by "
+             "default because read_csv('/etc/passwd') is a read, so the "
+             "write gate alone does not stop file exfiltration.",
+    ),
 ):
     """Open an interactive REPL against a profile's catalog."""
     from .repl import run_repl
 
+    if allow_local_files:
+        _duck.ALLOW_LOCAL_FILES = True
     if read_only:
         guard.SESSION.narrow("--read-only")
     cfg = _load_or_die(config_path)
@@ -155,6 +164,12 @@ def exec(
         help="Refuse writes. Applies the stronger check that also catches "
              "a write smuggled inside a CTE or after a semicolon.",
     ),
+    allow_local_files: bool = typer.Option(
+        False, "--allow-local-files",
+        help="Keep local filesystem access in a read-only session. Off by "
+             "default because read_csv('/etc/passwd') is a read, so the "
+             "write gate alone does not stop file exfiltration.",
+    ),
     mask: Optional[str] = typer.Option(
         None, "--mask",
         help="Mask recognisable PII in the results: `mask` to replace it, "
@@ -190,6 +205,8 @@ def exec(
     if warehouse:
         prof.warehouse = warehouse
 
+    if allow_local_files:
+        _duck.ALLOW_LOCAL_FILES = True
     if read_only:
         guard.SESSION.narrow("--read-only")
     # Default-open: with no flag, no env var and no profile key this is
@@ -235,6 +252,9 @@ def exec(
         rows, mask_report = _mask.mask_rows(policy, columns, rows)
     except Exception as e:
         err_console.print(f"[red]{scrub(str(e), secrets)}[/red]")
+        hint = _duck.explain_sandbox_error(e)
+        if hint:
+            err_console.print(f"[yellow]hint:[/yellow] {hint}")
         raise typer.Exit(code=1)
     finally:
         con.close()
@@ -247,6 +267,8 @@ def exec(
             f"{label} ({v['cells']} cells)" for label, v in mask_report.findings.items()
         ) or "nothing"
         err_console.print(f"[dim]masking {policy.mode}: {found}[/dim]")
+        for warning in _mask.detect_defeats(policy, query):
+            err_console.print(f"[yellow]warning:[/yellow] {warning}")
     if format == "table":
         render_table(console, columns, rows)
         console.print(f"[dim]{len(rows)} row{'s' if len(rows) != 1 else ''}[/dim]")
@@ -267,6 +289,12 @@ def mcp(
         help="Refuse writes for every call this server serves. Operator "
              "policy: a caller cannot relax it.",
     ),
+    allow_local_files: bool = typer.Option(
+        False, "--allow-local-files",
+        help="Keep local filesystem access in a read-only session. Off by "
+             "default because read_csv('/etc/passwd') is a read, so the "
+             "write gate alone does not stop file exfiltration.",
+    ),
 ):
     """Run lakesh as an MCP server on stdio.
 
@@ -284,6 +312,8 @@ def mcp(
     default.
     """
     from .mcp import serve
+    if allow_local_files:
+        _duck.ALLOW_LOCAL_FILES = True
     serve(config_path, read_only=read_only)
 
 

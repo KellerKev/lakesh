@@ -142,7 +142,7 @@ DESCRIBE_TABLE_SHAPES = ("object", "array")
 # production that it eats your order numbers.
 MASK_MODES = ("off", "mask", "audit")
 
-_MASKING_KEYS = frozenset({"mode", "rules"})
+_MASKING_KEYS = frozenset({"mode", "rules", "custom"})
 
 _ANNOTATION_KEYS = frozenset({"status", "max_staleness", "note", "superseded_by"})
 
@@ -226,6 +226,7 @@ class Profile:
     """Per-table annotations, keyed by `SCHEMA.TABLE` (globs allowed)."""
     masking_mode: str | None = None
     masking_rules: tuple[str, ...] | None = None
+    masking_custom: tuple = ()
     """Per-profile masking override; None means "use the global setting"."""
     # shared
     s3: S3Config = field(default_factory=S3Config)
@@ -355,6 +356,7 @@ class Config:
     source_path: Path | None = None
     masking_mode: str = "off"
     masking_rules: tuple[str, ...] | None = None
+    masking_custom: tuple = ()
     """Global masking default. See `lakesh.mask` for what masking does and,
     more importantly, what it does not."""
     describe_table_shape: str = "object"
@@ -459,7 +461,9 @@ def _parse_timeout(name: str, value: Any) -> float | None:
     return seconds
 
 
-def parse_masking(raw: Any, where: str) -> tuple[str, tuple[str, ...] | None]:
+def parse_masking(
+    raw: Any, where: str
+) -> tuple[str, tuple[str, ...] | None, tuple]:
     """(mode, rule labels or None) from a `[masking]` table.
 
     Unknown keys are rejected for the same reason table annotations reject
@@ -468,12 +472,16 @@ def parse_masking(raw: Any, where: str) -> tuple[str, tuple[str, ...] | None]:
     A `rules` entry naming a rule that does not exist is rejected too — a
     rule you thought you enabled and didn't is the same failure.
     """
-    from .mask import rule_index
+    from .mask import CustomRuleError, build_custom_rules, rule_index
 
     if raw is None:
-        return "off", None
+        return "off", None, ()
     if not isinstance(raw, dict):
         raise ConfigError(f"{where}: `masking` must be a table")
+    try:
+        custom = build_custom_rules(raw.get("custom") or {})
+    except CustomRuleError as e:
+        raise ConfigError(f"{where}: {e}") from None
     unknown = sorted(set(raw) - _MASKING_KEYS)
     if unknown:
         raise ConfigError(
@@ -489,10 +497,11 @@ def parse_masking(raw: Any, where: str) -> tuple[str, tuple[str, ...] | None]:
         )
     labels = raw.get("rules")
     if labels is None:
-        return mode, None
+        return mode, None, custom
     if not isinstance(labels, list):
         raise ConfigError(f"{where}: `masking.rules` must be a list of labels")
-    known = rule_index()
+    known = dict(rule_index())
+    known.update({r.label: r for r in custom})
     out = []
     for label in labels:
         name = str(label)
@@ -502,7 +511,7 @@ def parse_masking(raw: Any, where: str) -> tuple[str, tuple[str, ...] | None]:
                 f"(available: {', '.join(sorted(known))})"
             )
         out.append(name)
-    return mode, tuple(out)
+    return mode, tuple(out), custom
 
 
 def _parse_table_annotation(profile: str, key: str, raw: Any) -> TableAnnotation:
@@ -601,10 +610,10 @@ def _parse_profile(name: str, raw: dict) -> Profile:
     }
     profile_staleness = str(raw.get("max_staleness", ""))
     if "masking" in raw:
-        prof_mask_mode, prof_mask_rules = parse_masking(
+        prof_mask_mode, prof_mask_rules, prof_mask_custom = parse_masking(
             raw.get("masking"), f"profile {name!r}")
     else:
-        prof_mask_mode, prof_mask_rules = None, None
+        prof_mask_mode, prof_mask_rules, prof_mask_custom = None, None, ()
     p = Profile(
         name=name,
         type=ptype,
@@ -627,6 +636,7 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         tables=tables,
         masking_mode=prof_mask_mode,
         masking_rules=prof_mask_rules,
+        masking_custom=prof_mask_custom,
         s3=s3,
         oauth=oauth,
     )
@@ -666,12 +676,14 @@ def load_config(path: Path | None = None) -> Config:
             f"(supported: {', '.join(DESCRIBE_TABLE_SHAPES)})"
         )
 
-    mask_mode, mask_rules = parse_masking(data.get("masking"), str(path))
+    mask_mode, mask_rules, mask_custom = parse_masking(
+        data.get("masking"), str(path))
 
     return Config(
         profiles=profiles, default=default, source_path=path,
         describe_table_shape=shape,
         masking_mode=mask_mode, masking_rules=mask_rules,
+        masking_custom=mask_custom,
     )
 
 
@@ -695,6 +707,17 @@ default = "local"
 # [masking]
 # mode  = "off"                      # off | mask | audit
 # rules = ["pii.email", "pii.phone"] # override the default-on set
+
+# Your own masking patterns. Needs: pip install 'lakesh[mask]'
+# Compiled with RE2, which cannot backtrack — so an untrusted pattern
+# can't hang the server. RE2 has no lookaround or backreferences; a
+# pattern using them is refused rather than downgraded to `re`.
+# `requires` is a literal the pattern cannot match without, which lets
+# the scanner skip cells that cannot possibly match.
+# [masking.custom."pii.employee_id"]
+# value    = 'EMP-[0-9]{6}'
+# requires = "EMP-"
+
 
 
 # Output shape for the MCP `describe_table` tool: "object" (default)

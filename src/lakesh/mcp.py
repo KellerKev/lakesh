@@ -93,6 +93,7 @@ from .duck import (
 )
 from . import freshness
 from .oauth import AuthRequired
+from . import duck as _duck
 from . import guard
 from . import mask as _mask
 from .output import _stringify  # type: ignore[attr-defined]
@@ -507,6 +508,12 @@ def session_status() -> str:
         "summary": restriction.describe(),
         "writes_enabled_by_env": _writes_enabled(),
         "masking": {"mode": _SESSION_MASK["mode"], "relaxable": False},
+        "sandbox": {
+            # A sandbox you believe is on but isn't is worse than none,
+            # so report the skip reason rather than just a boolean.
+            "local_files_blocked": restriction.read_only and not _duck.ALLOW_LOCAL_FILES,
+            "skipped_because": _duck.LAST_SANDBOX_SKIP,
+        },
     })
 
 
@@ -1342,12 +1349,20 @@ def query(
             ),
         })
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+        hint = _duck.explain_sandbox_error(e)
+        if hint:
+            return json.dumps({
+                "error": scrub(str(e), _KNOWN_SECRETS),
+                "error_type": "sandboxed", "hint": hint,
+            })
         return _error(e)
 
     has_more = len(rows) > limit
     rows = rows[:limit]
-    rows, mask_report = _mask.mask_rows(policy, columns, rows)
     warnings: list[str] = []
+    rows, mask_report = _mask.mask_rows(policy, columns, rows)
+    warnings.extend(_mask.detect_defeats(policy, sql))
+    warnings.extend(_mask.detect_defeats(policy, sql))
     if offset and not _HAS_ORDER_BY.search(sql):
         warnings.append(
             "no ORDER BY detected: each page is a separate execution of the "
