@@ -60,8 +60,15 @@ from .config import Profile
 # --------------------------------------------------------------------------
 # what counts as a read
 
+# Statements that begin a read. Deliberately broader than ANSI, because
+# lakesh is a universal tool and each engine has its own spelling:
+#   from    — DuckDB's FROM-first syntax
+#   table   — Postgres / DuckDB `TABLE t`
+#   list    — Snowflake stage listing
+#   call    — resolved per-procedure, see `_call_is_read`
 _READ_ONLY_LEADING = re.compile(
-    r"^\s*(select|show|describe|desc|with|explain|pragma|values)\b",
+    r"^\s*(select|show|describe|desc|with|explain|pragma|values|from|table|"
+    r"list|call|use|analyze|begin|start|set)\b",
     re.IGNORECASE,
 )
 
@@ -69,81 +76,206 @@ _READ_ONLY_LEADING = re.compile(
 # what the engine can reach. `attach`/`install`/`load`/`copy` are here
 # because a read-only session that can ATTACH a writable database or COPY
 # a table to disk is not read-only in any sense the caller would expect.
+#
+# `do` is here because a Postgres DO block executes an arbitrary body,
+# and `execute` covers Snowflake's EXECUTE IMMEDIATE and prepared
+# statements. Neither can be inspected from the call site.
 _WRITE_KEYWORDS = frozenset({
     "insert", "update", "delete", "merge", "upsert", "replace",
     "create", "drop", "alter", "truncate", "rename",
     "grant", "revoke",
     "copy", "export", "import",
     "attach", "detach", "install", "load",
-    "set", "reset", "vacuum", "checkpoint", "analyze",
-    "begin", "commit", "rollback",
-    "call", "execute",
+    "reset", "vacuum", "checkpoint",
+    "commit", "rollback",
+    "do", "execute", "exec",
 })
 
-_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+# Verbs whose read/write nature depends on what follows them, resolved by
+# `_qualified_write` rather than by membership alone.
+_CONDITIONAL_KEYWORDS = frozenset({"set", "begin", "start", "call", "analyze"})
+
+# `BEGIN READ ONLY` / `START TRANSACTION READ ONLY` is the one transaction
+# form a read-only session should positively want, and `SET` is a
+# prerequisite for many legitimate read workloads (`SET SESSION …`,
+# `SET TIME ZONE`). Treat them as reads only when the read-only intent is
+# explicit or the setting is session-scoped.
+_READ_ONLY_QUALIFIER = re.compile(r"\bread\s+only\b", re.IGNORECASE)
+_SESSION_SET = re.compile(
+    r"^\s*set\s+(session|local|time\s+zone|timezone|search_path)\b", re.IGNORECASE)
+
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9$]*")
 
 # Single-quoted strings, double-quoted identifiers, backtick identifiers,
-# dollar-quoted bodies, line comments and block comments — in one pass, so
-# a comment inside a string and a string inside a comment both behave.
-_MASKABLE_RE = re.compile(
-    r"""
+# line comments and block comments. `#` is MySQL's and BigQuery's second
+# line-comment syntax.
+_QUOTED_RE = r"""
       '(?:[^']|'')*'          # 'text', with '' escaping
     | "(?:[^"]|"")*"          # "identifier"
     | `[^`]*`                 # `identifier`
-    | \$\$.*?\$\$             # $$body$$
     | --[^\n]*                # -- line comment
+    | \#[^\n]*                # # line comment (MySQL, BigQuery)
     | /\*.*?\*/               # /* block comment */
-    """,
-    re.VERBOSE | re.DOTALL,
-)
+"""
+
+# Dollar-quoted bodies, including the TAGGED form `$BODY$ … $BODY$` that
+# every `CREATE FUNCTION … LANGUAGE plpgsql` in the wild uses. The
+# backreference makes the closing tag match the opening one.
+_DOLLAR_RE = r"| \$(\w*)\$.*?\$\1\$"
+
+_MASKABLE_RE = re.compile(_QUOTED_RE + _DOLLAR_RE, re.VERBOSE | re.DOTALL)
+_EXECUTABLE_RE = re.compile(_QUOTED_RE, re.VERBOSE | re.DOTALL)
 
 
-def strip_literals(sql: str) -> str:
+def strip_literals(sql: str, *, keep_bodies: bool = False) -> str:
     """`sql` with string literals, quoted identifiers and comments blanked.
 
     Length-preserving, so any offset computed against the result still
     lines up with the original. The point is that
     `WHERE note = 'please delete'` and `-- drop this later` must not look
     like writes.
+
+    `keep_bodies=True` leaves dollar-quoted bodies intact. That
+    distinction matters and is easy to get backwards: a `$$ … $$` body is
+    a *literal* as far as masking is concerned, but it is *executable
+    code* as far as the write gate is concerned. Blanking it hides the
+    `DELETE` inside `DO $$ BEGIN DELETE FROM t; END $$`, which is exactly
+    how that statement used to pass the gate.
     """
-    return _MASKABLE_RE.sub(lambda m: " " * len(m.group()), sql)
+    pattern = _EXECUTABLE_RE if keep_bodies else _MASKABLE_RE
+    return pattern.sub(lambda m: " " * len(m.group()), sql)
+
+
+def _leads_like_read(sql: str) -> bool:
+    """Whether the statement *begins* like a read.
+
+    Runs against stripped SQL so a leading comment does not defeat it —
+    `/* note */ SELECT 1` is a read, and used to be refused because this
+    test saw the raw text while the error message took its head word from
+    the stripped text.
+
+    Not sufficient on its own: `CALL` and `BEGIN` lead like reads and may
+    not be, which is why `is_read_only` also consults `find_write`.
+    """
+    cleaned = strip_literals(sql, keep_bodies=True).strip().lstrip("(")
+    return bool(_READ_ONLY_LEADING.match(cleaned))
 
 
 def is_read_only(sql: str) -> bool:
-    """Leading-keyword check — the original gate, behaviour unchanged.
+    """Whether `sql` is a read.
 
-    Covers the obvious top-level cases only. `find_write` is strictly
-    stronger; this is kept because `EXPLAIN` / `SHOW` / `PRAGMA` are
-    legitimate reads that carry no write keyword for `find_write` to find,
-    so the two are used together.
+    Both halves of the judgement, not just the leading keyword: a
+    statement that starts like a read can still smuggle a write (`WITH x
+    AS (INSERT …)`, `SELECT 1; DROP TABLE t`, an unvouched `CALL`). This
+    used to be the leading-keyword test alone, which meant the
+    unrestricted MCP path applied a weaker gate than the read-only one.
     """
-    return bool(_READ_ONLY_LEADING.match(sql.strip().lstrip("(")))
+    return blocks_write(sql) is None
+
+
+def _is_function_call(cleaned: str, match: re.Match) -> bool:
+    """True when the word is a function call rather than a statement.
+
+    `replace(`, `truncate(`, `insert(` and `analyze(` are scalar
+    functions on one engine or another, and every one of them used to be
+    refused because the character before the word was `(` — which the old
+    rule read as "start of a subquery". A verb is a call when it is
+    followed by `(` and preceded by something that can precede an
+    expression.
+    """
+    after = cleaned[match.end():].lstrip()
+    if not after.startswith("("):
+        return False
+    before = cleaned[:match.start()].rstrip()
+    if not before:
+        return False                       # `INSERT (...)` at the head is DML
+    # A statement boundary before it means it really is a statement.
+    return before[-1] not in ";"
+
+
+def _qualified_write(sql: str, word: str, cleaned: str, start: int) -> bool:
+    """Whether a conditional verb is a write in this statement."""
+    if word in ("begin", "start"):
+        # `BEGIN READ ONLY` is the transaction form a read-only session
+        # most wants; a bare BEGIN opens a writable one.
+        return not _READ_ONLY_QUALIFIER.search(cleaned[start:start + 60])
+    if word == "set":
+        return not _SESSION_SET.match(cleaned[start:])
+    if word == "analyze":
+        # `EXPLAIN (ANALYZE …)` and `EXPLAIN ANALYZE …` are the same
+        # statement; the parenthesised spelling used to be refused and
+        # the bare one allowed.
+        return "explain" not in cleaned[:start].lower()
+    if word == "call":
+        return not _call_is_read(cleaned[start:])
+    return True
+
+
+# Procedures known to be reads. Populated by the dialect registry; this
+# is the fallback for a source with no registered dialect.
+_READ_PROCEDURES: set[str] = set()
+
+_CALL_TARGET_RE = re.compile(r"call\s+([\w.$]+)", re.IGNORECASE)
+
+
+def _call_is_read(fragment: str) -> bool:
+    """Whether `CALL x(...)` names a procedure vouched for as a read.
+
+    There is no way to determine this from the statement: Snowflake
+    deprecated the volatility keywords for procedures, procedure bodies
+    can build SQL at runtime, and procedures are not atomic — one that
+    fails midway can still have written. So lakesh never guesses. Either
+    the procedure is a built-in whose behaviour is known (DuckLake's read
+    procedures are a closed set) or a human listed it in config.
+    """
+    found = _CALL_TARGET_RE.match(fragment.lstrip())
+    if not found:
+        return False
+    return found.group(1).rsplit(".", 1)[-1].lower() in _READ_PROCEDURES
+
+
+def set_read_procedures(names) -> None:
+    """Install the allow-list for this session."""
+    _READ_PROCEDURES.clear()
+    _READ_PROCEDURES.update(n.lower() for n in names)
 
 
 def find_write(sql: str) -> str | None:
     """The first write keyword appearing at statement level, or None.
 
-    Runs over `strip_literals(sql)`, and only counts a keyword that starts
-    a clause — the token before it must be a statement boundary
-    (start-of-input, `;`, `(`, `)`, or one of the few words that can
-    legitimately precede a verb, like `AS` in a CTE). That is what lets
-    `SELECT delete_flag FROM t` and `SELECT * FROM updates` through while
-    catching `WITH x AS (INSERT …)`.
+    Runs over SQL whose literals and comments are blanked but whose
+    dollar-quoted bodies are **kept**, so a write inside a procedure body
+    is still visible.
     """
-    cleaned = strip_literals(sql)
+    cleaned = strip_literals(sql, keep_bodies=True)
     prev: str | None = None
     for match in _WORD_RE.finditer(cleaned):
         word = match.group().lower()
-        if word in _WRITE_KEYWORDS and _starts_a_clause(cleaned, match.start(), prev):
-            return word.upper()
-        prev = word
+        if word not in _WRITE_KEYWORDS and word not in _CONDITIONAL_KEYWORDS:
+            prev = word
+            continue
+        if _is_function_call(cleaned, match):
+            prev = word
+            continue
+        if not _starts_a_clause(cleaned, match.start(), prev):
+            prev = word
+            continue
+        if word in _CONDITIONAL_KEYWORDS and not _qualified_write(
+                sql, word, cleaned, match.start()):
+            prev = word
+            continue
+        return word.upper()
     return None
 
 
-# Tokens after which a verb genuinely begins a new clause. `as` covers
-# `WITH x AS (INSERT …)`; the bracket forms cover subqueries and stacked
-# statements.
-_CLAUSE_OPENERS = frozenset({"as", "then", "else", "do", "begin", "union", "all"})
+# Tokens after which a verb genuinely begins a new clause.
+#
+# `as` is deliberately NOT here: `WITH x AS (INSERT …)` is already caught
+# by the `(` rule, while treating `as` as an opener refuses
+# `SELECT * FROM tbl AS load` — any alias that collides with a verb.
+# Same reasoning retires `then`/`else`, which only ever fired on CASE
+# expressions containing a function like `replace()`.
+_CLAUSE_OPENERS = frozenset({"do", "begin", "union"})
 
 
 def _starts_a_clause(cleaned: str, start: int, prev: str | None) -> bool:
@@ -166,8 +298,8 @@ def blocks_write(sql: str) -> str | None:
     found = find_write(sql)
     if found:
         return found
-    if not is_read_only(sql):
-        head = _WORD_RE.search(strip_literals(sql))
+    if not _leads_like_read(sql):
+        head = _WORD_RE.search(strip_literals(sql, keep_bodies=True))
         return head.group().upper() if head else "statement"
     return None
 

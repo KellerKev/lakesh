@@ -155,7 +155,17 @@ def _lit(value: str) -> str:
 
 
 def _not_system_schemas(column: str) -> str:
-    return f"{column} NOT IN ({', '.join(_lit(s) for s in _SYSTEM_SCHEMAS)})"
+    """Exclude the engine's own schemas, case-insensitively.
+
+    Snowflake and SQL Server return schema names upper-cased, so a
+    case-sensitive `NOT IN ('information_schema')` does not match
+    `INFORMATION_SCHEMA` — which put ~60-70 views per Snowflake database
+    back into every listing, the exact noise the native path exists to
+    remove. `LOWER()` is ANSI and available on every engine lakesh
+    reaches.
+    """
+    names = ", ".join(_lit(s.lower()) for s in _SYSTEM_SCHEMAS)
+    return f"LOWER({column}) NOT IN ({names})"
 
 
 # --------------------------------------------------------------------------
@@ -1361,7 +1371,6 @@ def query(
     rows = rows[:limit]
     warnings: list[str] = []
     rows, mask_report = _mask.mask_rows(policy, columns, rows)
-    warnings.extend(_mask.detect_defeats(policy, sql))
     warnings.extend(_mask.detect_defeats(policy, sql))
     if offset and not _HAS_ORDER_BY.search(sql):
         warnings.append(
