@@ -16,6 +16,7 @@ from prompt_toolkit.styles import Style
 from pygments.lexers.sql import SqlLexer
 from rich.console import Console
 
+from . import dialect as _dialect
 from . import guard
 from .config import Profile
 from .duck import catalog_alias
@@ -206,6 +207,7 @@ def run_repl(profile: Profile, con: duckdb.DuckDBPyConnection, console: Console)
         multiline=True,
         style=Style.from_dict({"prompt": "ansigreen"}),
     )
+    guard.set_read_procedures(_dialect.read_procedures_for(profile))
     state = {"timing": True, "format": "table"}
     try:
         while True:

@@ -337,3 +337,36 @@ def test_the_table_function_spelling_was_always_allowed():
     worked while the CALL spelling did not — which is what made the
     inconsistency obvious."""
     assert blocks_write("SELECT * FROM ducklake_snapshots('lake')") is None
+
+
+# --------------------------------------------------------------------------
+# the optional sqlglot second opinion
+
+
+def test_sqlglot_is_optional_and_absent_changes_nothing(monkeypatch):
+    """The safety floor must be identical whether or not the package is
+    installed — otherwise a safety control behaves differently depending
+    on the environment."""
+    import builtins
+    real = builtins.__import__
+
+    def _no_sqlglot(name, *a, **k):
+        if name == "sqlglot":
+            raise ImportError("absent")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_sqlglot)
+    assert blocks_write("SELECT 1") is None
+    assert blocks_write("DROP TABLE t") == "DROP"
+    assert blocks_write("WITH x AS (INSERT INTO t VALUES (1)) SELECT * FROM x") == "INSERT"
+
+
+def test_sqlglot_can_only_tighten_never_permit():
+    """It is consulted last, only after the keyword scan has already said
+    'read'. It has no path to overturn a refusal."""
+    import inspect
+    from lakesh.guard import blocks_write as bw
+    source = inspect.getsource(bw)
+    # The sqlglot call is the final return, i.e. reached only when nothing
+    # else objected.
+    assert source.rstrip().endswith("return _sqlglot_write(sql, dialect_name)")

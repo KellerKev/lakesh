@@ -64,17 +64,14 @@ DIALECT_DUCKDB = "duckdb"
 def source_dialect(profile: Profile) -> str:
     """Which metadata vocabulary this profile's source speaks.
 
-    A substring test, because `driver` is usually a path to a shared
-    library (`/…/libadbc_driver_snowflake.so`) rather than a bare name.
+    Delegates to the dialect registry, which resolves on the driver's
+    basename and honours an explicit `dialect =` override. This function
+    used to hold its own substring test — one of three copies of the same
+    logic in three modules.
     """
-    if profile.type != "adbc":
-        return DIALECT_DUCKDB
-    driver = (profile.driver or "").lower()
-    if "snowflake" in driver:
-        return DIALECT_SNOWFLAKE
-    if "postgres" in driver:
-        return DIALECT_POSTGRES
-    return DIALECT_ANSI
+    from . import dialect as _dialect
+
+    return _dialect.for_profile(profile).name
 
 
 def reports_last_modified(dialect: str) -> bool:
@@ -109,15 +106,17 @@ _POSTGRES_JOIN = (
 
 def listing_columns(dialect: str) -> str:
     """Extra SELECT-list columns, or '' when the source has none."""
+    from . import dialect as _dialect
+
     if dialect == DIALECT_SNOWFLAKE:
         return _SNOWFLAKE_COLUMNS
-    if dialect == DIALECT_POSTGRES:
-        return _POSTGRES_COLUMNS
-    return ""
+    return _dialect.get(dialect).freshness_columns
 
 
 def listing_join(dialect: str) -> str:
-    return _POSTGRES_JOIN if dialect == DIALECT_POSTGRES else ""
+    from . import dialect as _dialect
+
+    return _dialect.get(dialect).freshness_join
 
 
 # --------------------------------------------------------------------------

@@ -93,6 +93,7 @@ from .duck import (
 )
 from . import freshness
 from .oauth import AuthRequired
+from . import dialect as _dialect
 from . import duck as _duck
 from . import guard
 from . import mask as _mask
@@ -168,6 +169,19 @@ def _not_system_schemas(column: str) -> str:
     return f"LOWER({column}) NOT IN ({names})"
 
 
+def _not_system_schemas_for(profile: Profile | None, column: str) -> str:
+    """The same exclusion, using the engine's own system-schema list.
+
+    MySQL's `sys`, SQL Server's `sys` and Snowflake's single
+    `INFORMATION_SCHEMA` are all different sets; a shared constant was
+    the DuckDB+Postgres union and nothing else.
+    """
+    if profile is None:
+        return _not_system_schemas(column)
+    names = ", ".join(_lit(n) for n in _dialect.for_profile(profile).system_schemas)
+    return f"LOWER({column}) NOT IN ({names})"
+
+
 # --------------------------------------------------------------------------
 # pattern matching for search_objects
 
@@ -194,6 +208,19 @@ def _like_pattern(pattern: str) -> str:
         .replace("_", _LIKE_ESCAPE + "_")
     )
     return escaped if "%" in escaped else f"%{escaped}%"
+
+
+def _ilike_for(profile: Profile | None, column: str, like: str) -> str:
+    """Case-insensitive match in whatever spelling the engine has.
+
+    `ILIKE` exists on Snowflake, Postgres and DuckDB; MySQL, SQL Server,
+    Trino, BigQuery and SQLite have no such operator, so they get
+    `LOWER(x) LIKE LOWER(y)` instead of a syntax error.
+    """
+    if profile is None:
+        return _ilike(column, like)
+    return _dialect.ilike_expr(
+        _dialect.for_profile(profile), column, _lit(like), _lit(_LIKE_ESCAPE))
 
 
 def _ilike(column: str, like: str) -> str:
@@ -577,7 +604,7 @@ def list_namespaces(profile: str | None = None) -> str:
             with _open_native(profile) as (con, handle, _prof):
                 _cols, rows = _native(con, handle, (
                     "SELECT schema_name FROM information_schema.schemata "
-                    f"WHERE {_not_system_schemas('schema_name')} "
+                    f"WHERE {_not_system_schemas_for(prof, 'schema_name')} "
                     "ORDER BY 1"
                 ))
         else:
@@ -615,7 +642,7 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
                 + (f", {extra}" if extra else "")
                 + " FROM information_schema.tables t"
                 + freshness.listing_join(dialect)
-                + f" WHERE {_not_system_schemas('t.table_schema')}"
+                + f" WHERE {_not_system_schemas_for(prof, 't.table_schema')}"
             )
             if namespace:
                 sql += f" AND t.table_schema = {_lit(namespace)}"
@@ -773,7 +800,8 @@ def _search_legs(match: str) -> tuple[str, ...]:
     return _SEARCH_LEGS if match == "all" else (match,)
 
 
-def _search_sql_native(like: str, namespace: str | None, match: str) -> str:
+def _search_sql_native(like: str, namespace: str | None, match: str,
+                       prof: Profile | None = None) -> str:
     """One statement for the source's own information_schema."""
     ns_table = f" AND t.table_schema = {_lit(namespace)}" if namespace else ""
     ns_col = f" AND c.table_schema = {_lit(namespace)}" if namespace else ""
@@ -785,7 +813,7 @@ def _search_sql_native(like: str, namespace: str | None, match: str) -> str:
             "CAST(NULL AS VARCHAR) AS data_type "
             "FROM information_schema.schemata s "
             f"WHERE {_not_system_schemas('s.schema_name')} "
-            f"  AND {_ilike('s.schema_name', like)}"
+            f"  AND {_ilike_for(prof, 's.schema_name', like)}"
         ),
         # Every leg carries the full alias list, not just the first. A
         # UNION takes its column names from whichever branch leads, and
@@ -799,8 +827,8 @@ def _search_sql_native(like: str, namespace: str | None, match: str) -> str:
             "CAST(NULL AS VARCHAR) AS object_column, "
             "CAST(NULL AS VARCHAR) AS data_type "
             "FROM information_schema.tables t "
-            f"WHERE {_not_system_schemas('t.table_schema')}{ns_table} "
-            f"  AND {_ilike('t.table_name', like)}"
+            f"WHERE {_not_system_schemas_for(prof, 't.table_schema')}{ns_table} "
+            f"  AND {_ilike_for(prof, 't.table_name', like)}"
         ),
         "column": (
             "SELECT 'column' AS matched_on, c.table_schema AS object_schema, "
@@ -808,7 +836,7 @@ def _search_sql_native(like: str, namespace: str | None, match: str) -> str:
             "c.data_type AS data_type "
             "FROM information_schema.columns c "
             f"WHERE {_not_system_schemas('c.table_schema')}{ns_col} "
-            f"  AND {_ilike('c.column_name', like)}"
+            f"  AND {_ilike_for(prof, 'c.column_name', like)}"
         ),
     }
     # A namespace filter makes the schema leg meaningless — the caller has
@@ -821,7 +849,8 @@ def _search_sql_native(like: str, namespace: str | None, match: str) -> str:
 
 
 def _search_sql_duckdb(
-    like: str, namespace: str | None, match: str, catalog: str
+    like: str, namespace: str | None, match: str, catalog: str,
+    prof: Profile | None = None,
 ) -> tuple[str, list]:
     """Same shape against DuckDB's own catalog, but bound rather than
     interpolated — DuckDB takes real parameters, so use them."""
@@ -838,7 +867,7 @@ def _search_sql_duckdb(
                 "CAST(NULL AS VARCHAR) AS data_type "
                 "FROM information_schema.schemata "
                 "WHERE catalog_name = ? "
-                f"  AND {_not_system_schemas('schema_name')} "
+                f"  AND {_not_system_schemas_for(prof, 'schema_name')} "
                 f"  AND schema_name ILIKE ? ESCAPE {_lit(_LIKE_ESCAPE)}"
             )
             params += [catalog, like]
@@ -932,13 +961,13 @@ def _search_one(
     """(results, truncated_at, mode) for a single profile."""
     prof = _profile_of(profile_name)
     if _prefer_native(prof):
-        sql = _wrap_search(_search_sql_native(like, namespace, match), limit)
+        sql = _wrap_search(_search_sql_native(like, namespace, match, prof), limit)
         with _open_native(profile_name) as (con, handle, _prof):
             _cols, rows = _native(con, handle, sql)
         mode = "native"
     else:
         with _open(profile_name) as (con, catalog):
-            body, params = _search_sql_duckdb(like, namespace, match, catalog)
+            body, params = _search_sql_duckdb(like, namespace, match, catalog, prof)
             rows = con.execute(_wrap_search(body, limit), params).fetchall()
         mode = "duckdb"
 
@@ -1082,6 +1111,16 @@ def _estimate_query(
     native = mode == "native"
 
     if want == "count":
+        if _UNWRAPPABLE.match(sql.strip().lstrip("(")):
+            # A count probe wraps the statement in a derived table, which
+            # a non-relational statement cannot survive. Saying so beats
+            # emitting a syntax error.
+            out["method"] = "unavailable"
+            out["reason"] = (
+                "this statement is not a relation, so it cannot be wrapped "
+                "in a count probe. Run it and count the rows instead."
+            )
+            return json.dumps(out)
         probe = _count_probe(sql)
         try:
             if native:
@@ -1107,15 +1146,24 @@ def _estimate_query(
         return json.dumps(out, default=str)
 
     # want == "plan"
-    driver = (prof.driver or "").lower()
-    if native and "postgres" in driver:
-        # Not a failure to route around silently: the routing advice is
-        # the entire value of the answer on this source.
-        out["method"] = "unavailable"
-        out["reason"] = _POSTGRES_NO_EXPLAIN
-        return json.dumps(out)
-
-    explain = f"EXPLAIN USING JSON {sql}" if native else f"EXPLAIN (FORMAT json) {sql}"
+    #
+    # Branch on the DIALECT, not on whether we happen to be on the native
+    # path. `EXPLAIN USING JSON` is Snowflake's spelling and nothing
+    # else's, and it used to be sent to every native source.
+    if native:
+        source = _dialect.for_profile(prof)
+        explain = _dialect.explain_sql(source, sql)
+        if explain is None:
+            out["method"] = "unavailable"
+            out["reason"] = (
+                _POSTGRES_NO_EXPLAIN if source.name == "postgres" else
+                f"the {source.name} profile has no plan available over the "
+                f"native path. Re-run with estimate=\"count\" for an exact "
+                f"count, or native=false to plan through DuckDB."
+            )
+            return json.dumps(out)
+    else:
+        explain = f"EXPLAIN (FORMAT json) {sql}"
     try:
         if native:
             with _open_native(profile_name, timeout) as (con, handle, _p):
@@ -1274,6 +1322,9 @@ def query(
     # deliberately does not latch, because a routine parameter quietly
     # restricting the rest of the session would surprise the caller.
     # `set_read_only()` is the latch.
+    # `CALL` can only be allowed for procedures the dialect or the
+    # operator vouches for; install that list before the gate runs.
+    guard.set_read_procedures(_dialect.read_procedures_for(prof))
     policy = _mask.resolve(
         _load_or_raise(), prof, requested=mask,
         session_mode=_SESSION_MASK["mode"],

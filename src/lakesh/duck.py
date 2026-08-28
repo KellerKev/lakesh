@@ -499,6 +499,13 @@ def deadline(
         timer.cancel()
 
 
+def _timeout_sql_for(profile: Profile, seconds: float) -> str | None:
+    """The source's own statement timeout, from the dialect registry."""
+    from . import dialect as _dialect
+
+    return _dialect.timeout_sql(_dialect.for_profile(profile), seconds)
+
+
 def _driver_timeout_sql(driver: str, seconds: float) -> str | None:
     """The source's own statement timeout, when it has one we can set
     over the same connection. Matching is a substring test because
@@ -531,7 +538,7 @@ def arm_driver_timeout(
     """
     if not seconds or seconds <= 0:
         return False
-    sql = _driver_timeout_sql(profile.driver, seconds)
+    sql = _timeout_sql_for(profile, seconds)
     if not sql:
         return False
     try:

@@ -25,6 +25,7 @@ from . import duck as _duck
 from .duck import adbc_native_scan, catalog_alias, connect, connect_native
 from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
+from . import dialect as _dialect
 from . import guard
 from . import mask as _mask
 from .redact import profile_secrets, redact_option, redact_uri, scrub
@@ -209,6 +210,7 @@ def exec(
         _duck.ALLOW_LOCAL_FILES = True
     if read_only:
         guard.SESSION.narrow("--read-only")
+    guard.set_read_procedures(_dialect.read_procedures_for(prof))
     # Default-open: with no flag, no env var and no profile key this is
     # `None` and `lakesh exec -q 'INSERT ...'` behaves exactly as it always
     # has. The stronger scan runs only when a restriction is in force.

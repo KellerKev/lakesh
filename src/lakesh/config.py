@@ -228,6 +228,14 @@ class Profile:
     masking_rules: tuple[str, ...] | None = None
     masking_custom: tuple = ()
     """Per-profile masking override; None means "use the global setting"."""
+    dialect: str = ""
+    """Override the engine guess. The guess reads the driver's basename,
+    which is right almost always and wrong for an unusual layout — this
+    is the escape hatch."""
+    read_procedures: tuple[str, ...] = ()
+    """Procedures the operator vouches for as reads, so `CALL` on them is
+    allowed in a read-only session. A declaration, not a verification:
+    lakesh cannot check what a procedure does."""
     # shared
     s3: S3Config = field(default_factory=S3Config)
     oauth: OAuthConfig = field(default_factory=OAuthConfig)
@@ -305,6 +313,13 @@ class Profile:
                     f"option value"
                 )
         # Type-agnostic: annotations apply to every profile type.
+        if self.dialect:
+            from .dialect import known_dialects
+            if self.dialect.lower() not in known_dialects():
+                raise ConfigError(
+                    f"profile {self.name!r}: unknown dialect {self.dialect!r} "
+                    f"(supported: {', '.join(known_dialects())})"
+                )
         if self.status not in TABLE_STATUSES:
             raise ConfigError(
                 f"profile {self.name!r}: unknown status {self.status!r} "
@@ -637,6 +652,9 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         masking_mode=prof_mask_mode,
         masking_rules=prof_mask_rules,
         masking_custom=prof_mask_custom,
+        dialect=str(raw.get("dialect", "")),
+        read_procedures=tuple(
+            str(n) for n in (raw.get("read_procedures") or [])),
         s3=s3,
         oauth=oauth,
     )
@@ -707,6 +725,16 @@ default = "local"
 # [masking]
 # mode  = "off"                      # off | mask | audit
 # rules = ["pii.email", "pii.phone"] # override the default-on set
+
+# Override the engine guess, which normally reads the driver's basename.
+# One of: duckdb | postgres | snowflake | ansi
+# dialect = "postgres"
+
+# Procedures you vouch for as reads, so CALL on them is allowed in a
+# read-only session. A declaration, not a verification: lakesh cannot
+# check what a procedure does. DuckLake's read procedures ship as known.
+# read_procedures = ["my_reporting_proc"]
+
 
 # Your own masking patterns. Needs: pip install 'lakesh[mask]'
 # Compiled with RE2, which cannot backtrack — so an untrusted pattern

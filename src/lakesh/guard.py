@@ -287,7 +287,44 @@ def _starts_a_clause(cleaned: str, start: int, prev: str | None) -> bool:
     return prev in _CLAUSE_OPENERS
 
 
-def blocks_write(sql: str) -> str | None:
+# sqlglot, when installed, is consulted as a SECOND opinion that can only
+# ever *add* a refusal. The keyword scan stays authoritative for allowing,
+# so the safety floor is identical whether or not the package is present —
+# which is the property a safety control needs. sqlglot degrades
+# unparseable statements to `exp.Command`, whose only useful field is the
+# leading keyword, i.e. the same signal the keyword scan already uses; the
+# gain is on the statements it *does* parse.
+_SQLGLOT_WRITES = (
+    "Insert", "Update", "Delete", "Merge", "Create", "Drop", "Alter",
+    "TruncateTable", "Copy", "Grant", "Revoke",
+)
+
+
+def _sqlglot_write(sql: str, dialect_name: str = "") -> str | None:
+    """A write sqlglot sees that the keyword scan missed, or None.
+
+    Never used to permit anything: a parse failure, a missing package or
+    an unrecognised node all return None and leave the keyword scan's
+    verdict standing.
+    """
+    try:
+        import sqlglot
+    except ImportError:
+        return None
+    try:
+        parsed = sqlglot.parse(sql, dialect=dialect_name or None)
+    except Exception:
+        return None                      # unparseable: keyword scan stands
+    for statement in parsed:
+        if statement is None:
+            continue
+        kind = type(statement).__name__
+        if kind in _SQLGLOT_WRITES:
+            return kind.replace("Table", "").upper()
+    return None
+
+
+def blocks_write(sql: str, dialect_name: str = "") -> str | None:
     """Why `sql` is not a read, or None if it is one.
 
     `find_write` first because it is strictly stronger; the leading-keyword
@@ -301,7 +338,7 @@ def blocks_write(sql: str) -> str | None:
     if not _leads_like_read(sql):
         head = _WORD_RE.search(strip_literals(sql, keep_bodies=True))
         return head.group().upper() if head else "statement"
-    return None
+    return _sqlglot_write(sql, dialect_name)
 
 
 # --------------------------------------------------------------------------

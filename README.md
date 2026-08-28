@@ -740,6 +740,59 @@ Annotations are **unenforced assertions**: nothing checks that
 `ANALYTICS.FCT_REVENUE` still exists, so a rename silently drops its
 annotation and the deprecated twin keeps looking clean.
 
+### Native SQL, per platform
+
+lakesh runs each engine's own SQL, not a lowest common denominator. What
+that means concretely:
+
+- **DuckLake / Iceberg / DuckDB** — `CALL ducklake_snapshots('lake')`,
+  DuckDB's `FROM`-first syntax, `TABLE t`, `PIVOT`, `QUALIFY`.
+- **Snowflake** — `SHOW`, `DESCRIBE`, `LIST @stage`, `QUALIFY`,
+  `LATERAL FLATTEN`, and stored procedures via `CALL` (see below).
+- **Postgres** — `DO` blocks, dollar-quoted function bodies (`$$` and the
+  tagged `$BODY$` form), `EXPLAIN (ANALYZE, FORMAT JSON)`.
+
+Engine differences live in one place, `src/lakesh/dialect.py`, as data
+rather than as branches. Each capability degrades to *unavailable* rather
+than to a wrong answer: an engine with no `EXPLAIN` reachable over its
+path says so instead of being sent Snowflake's spelling and returning a
+syntax error.
+
+**First-class:** DuckLake/Iceberg/DuckDB, Postgres, Snowflake — the ones
+that can actually be tested. Everything else (MySQL, Trino, BigQuery,
+SQL Server, SQLite) gets an ANSI profile that claims nothing it cannot
+deliver. Writing those profiles from documentation is how a "universal"
+tool acquires quietly-wrong behaviour, so they are deliberately absent
+until there is a source to test against.
+
+If the driver-path guess is wrong for your layout, correct it:
+
+```toml
+[profiles.mysource]
+dialect = "postgres"     # duckdb | postgres | snowflake | ansi
+```
+
+#### Stored procedures and `CALL`
+
+`CALL` cannot be classified from the statement. Snowflake deprecated the
+volatility keywords for procedures, a procedure body can build SQL at
+runtime, and procedures are not atomic — one that fails midway can still
+have written. So lakesh does not guess.
+
+In a read-only session a `CALL` is refused unless the procedure is known
+to be a read. DuckLake's read procedures are a closed set and ship as
+known (`ducklake_snapshots`, `ducklake_table_info`, `ducklake_list_files`
+and friends); its write procedures are not. For anything else, vouch for
+it yourself:
+
+```toml
+[profiles.snow]
+read_procedures = ["my_reporting_proc", "SYSTEM$CLUSTERING_INFORMATION"]
+```
+
+That is a **declaration, not a verification** — lakesh cannot check what
+a procedure does, and this list is you saying you have.
+
 ### Read-only sessions
 
 A user *or the agent itself* can give up write access for the rest of a

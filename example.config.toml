@@ -11,6 +11,16 @@ default = "local"
 # mode  = "off"                      # off | mask | audit
 # rules = ["pii.email", "pii.phone"] # override the default-on set
 
+# Override the engine guess, which normally reads the driver's basename.
+# One of: duckdb | postgres | snowflake | ansi
+# dialect = "postgres"
+
+# Procedures you vouch for as reads, so CALL on them is allowed in a
+# read-only session. A declaration, not a verification: lakesh cannot
+# check what a procedure does. DuckLake's read procedures ship as known.
+# read_procedures = ["my_reporting_proc"]
+
+
 # Your own masking patterns. Needs: pip install 'lakesh[mask]'
 # Compiled with RE2, which cannot backtrack — so an untrusted pattern
 # can't hang the server. RE2 has no lookaround or backreferences; a
