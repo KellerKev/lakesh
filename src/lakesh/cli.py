@@ -765,3 +765,49 @@ def stage_rm(
         f"[green]removed[/green] {result['removed']} from {result['target']} "
         f"({result['remaining']} remaining)"
     )
+
+
+@stage_app.command("load")
+def stage_load(
+    table: str = typer.Argument(..., help="Existing target table."),
+    target: str = typer.Argument(..., help="Stage to load from, e.g. @~/exports."),
+    profile: Optional[str] = typer.Option(None, "-p", "--profile"),
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+    file_format: Optional[str] = typer.Option(
+        None, "--format", help="Inline file format, e.g. 'TYPE=CSV SKIP_HEADER=1'."),
+    create: bool = typer.Option(
+        False, "--create",
+        help="Create the table first from the staged file's inferred schema. "
+             "Off by default: a typo in the table name would then create a "
+             "new table instead of failing. Needs `infer_file_format` set, "
+             "because INFER_SCHEMA requires a named file format object.",
+    ),
+):
+    """Load a staged file into a table.
+
+    Loads FROM a stage INTO a table. The reverse direction — unloading a
+    table out to a stage — is deliberately not supported.
+    """
+    from . import staging
+
+    prof = _stage_profile(profile, config_path)
+    restriction = guard.SESSION.effective(prof)
+    if restriction.read_only:
+        payload = guard.refusal(restriction, "COPY")
+        err_console.print(f"[red]{payload['error']}[/red]")
+        raise typer.Exit(code=2)
+    try:
+        result = staging.load(prof, table, target,
+                              file_format=file_format or "", create=create)
+    except staging.StagingError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    except Exception as e:
+        err_console.print(f"[red]load failed:[/red] {scrub(str(e), profile_secrets(prof))}")
+        raise typer.Exit(code=1)
+    loaded = result.get("rows_loaded")
+    console.print(
+        f"[green]loaded[/green] {result['from']} -> {result['table']}"
+        + (f" ({loaded} rows)" if loaded is not None else "")
+        + f"  [dim]now {result['rows_after']} rows[/dim]"
+    )

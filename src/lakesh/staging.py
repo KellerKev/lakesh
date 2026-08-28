@@ -210,3 +210,115 @@ def remove(profile: Profile, target: str) -> dict:
     _run(profile, ops.remove(target))
     after = len(listing(profile, target))
     return {"target": target, "removed": max(0, before - after), "remaining": after}
+
+
+# --------------------------------------------------------------------------
+# loading a staged file into a table
+#
+# `COPY INTO` runs in both directions on Snowflake: stage -> table
+# (loading) and table -> stage (unloading). lakesh only builds the
+# loading direction. The unload form writes table contents out to a
+# stage, which is an export path rather than an import one, and it is not
+# what this feature is for — so the SQL is composed here rather than
+# accepted from the caller, and the target is validated as a stage.
+
+
+def _valid_table(name: str) -> str:
+    """A table name safe to interpolate, or raise.
+
+    A table name cannot be a bound parameter, so it goes into the
+    statement as text and has to be validated rather than escaped.
+    """
+    from .dialect import QUALIFIED_NAME_RE
+
+    cleaned = str(name).strip()
+    if not QUALIFIED_NAME_RE.match(cleaned):
+        raise StagingError(
+            f"{name!r} is not a plain table name. Use `table`, "
+            f"`schema.table` or `db.schema.table` — a name cannot be "
+            f"parameterised, so anything else is refused rather than quoted."
+        )
+    return cleaned
+
+
+def _valid_stage(target: str) -> str:
+    """A stage reference, not a table.
+
+    Guards the direction: `COPY INTO t FROM @s` loads, `COPY INTO @s FROM t`
+    unloads. Only the first is built here, and requiring the source to
+    look like a stage keeps a caller from inverting it.
+    """
+    cleaned = str(target).strip()
+    if not cleaned.startswith("@"):
+        raise StagingError(
+            f"{target!r} is not a stage reference — it must start with `@`, "
+            f"e.g. @~/exports. lakesh loads FROM a stage INTO a table; the "
+            f"unload direction is not supported."
+        )
+    if any(c in cleaned for c in "'\";"):
+        raise StagingError(f"{target!r} contains characters not valid in a stage path")
+    return cleaned
+
+
+def load(
+    profile: Profile, table: str, target: str, *,
+    file_format: str = "", create: bool = False,
+) -> dict:
+    """Load a staged file into an existing table.
+
+    `create=True` asks the engine to create the table from the staged
+    file's inferred schema first. It is off by default because a typo in
+    a table name then silently creates a new table instead of failing,
+    and inferred types are usually wrong in ways that surface much later.
+    """
+    ops = _ops_or_raise(profile)
+    if ops.load is None:
+        raise StagingError(
+            f"profile {profile.name!r} cannot load a staged file into a table "
+            f"over this path."
+        )
+    table = _valid_table(table)
+    target = _valid_stage(target)
+    fmt = file_format or getattr(profile, "file_format", "") or ops.default_format
+
+    if create:
+        named = getattr(profile, "infer_file_format", "") or ""
+        if not ops.infer_create or not named:
+            raise StagingError(
+                "auto-create needs a NAMED file format object, because "
+                "INFER_SCHEMA does not accept an inline format. Create one "
+                "in the source and name it in the profile, e.g. "
+                "infer_file_format = \"MYDB.FMTS.CSV_INFER\" — or create the "
+                "table yourself and load without --create."
+            )
+        _valid_table(named)
+        _run(profile, ops.infer_create(table, target, named))
+
+    before = _count(profile, table)
+    columns, rows = _run(profile, ops.load(table, target, fmt))
+    after = _count(profile, table)
+
+    result = {
+        "table": table,
+        "from": target,
+        "file_format": fmt,
+        "created": bool(create),
+        "rows_after": after,
+    }
+    if rows:
+        # Snowflake reports per-file status when it returns rows at all.
+        result["report"] = [dict(zip(columns, row)) for row in rows]
+    if before is not None and after is not None:
+        # The count delta is the reliable signal: a PUT over this path
+        # returns no rows, so a COPY may not either, and its own status
+        # would not prove the data landed regardless.
+        result["rows_loaded"] = max(0, after - before)
+    return result
+
+
+def _count(profile: Profile, table: str) -> int | None:
+    try:
+        _cols, rows = _run(profile, f"SELECT count(*) AS n FROM {table}")
+        return int(rows[0][0]) if rows else None
+    except Exception:
+        return None            # table may not exist yet; the load will say so

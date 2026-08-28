@@ -236,6 +236,11 @@ class Profile:
     """Directories this profile may stage files from. Empty means uploads
     are refused — an unconfigured allow-list means the feature is off, not
     that everything is permitted."""
+    file_format: str = ""
+    """Inline file format for loads, e.g. "TYPE=CSV SKIP_HEADER=1"."""
+    infer_file_format: str = ""
+    """A NAMED file format object, required for `--create` because
+    INFER_SCHEMA does not accept an inline spec."""
     max_upload_bytes: int = 0
     """0 uses the default in `staging`."""
     read_procedures: tuple[str, ...] = ()
@@ -668,6 +673,8 @@ def _parse_profile(name: str, raw: dict) -> Profile:
             str(n) for n in (raw.get("read_procedures") or [])),
         upload_roots=tuple(str(n) for n in (raw.get("upload_roots") or [])),
         max_upload_bytes=int(raw.get("max_upload_bytes", 0) or 0),
+        file_format=str(raw.get("file_format", "")),
+        infer_file_format=str(raw.get("infer_file_format", "")),
         s3=s3,
         oauth=oauth,
     )
@@ -755,6 +762,13 @@ default = "local"
 # upload is read by the source's driver, outside DuckDB's reach.
 # upload_roots     = ["~/data/exports"]
 # max_upload_bytes = 104857600        # default 100 MB
+
+# File format for `stage load` (COPY INTO). Inline spec.
+# file_format = "TYPE=CSV SKIP_HEADER=1"
+# A NAMED file format object, required only for `stage load --create`:
+# Snowflake's INFER_SCHEMA does not accept an inline format.
+# infer_file_format = "MYDB.FMTS.CSV_INFER"
+
 
 
 

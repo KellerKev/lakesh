@@ -625,6 +625,44 @@ def stage_upload(local_path: str, target: str, profile: str | None = None) -> st
 
 
 @server.tool()
+def stage_load(
+    table: str, target: str, profile: str | None = None,
+    file_format: str | None = None, create: bool = False,
+) -> str:
+    """Load a staged file into an existing table.
+
+    Loads FROM a stage INTO a table; the reverse direction (unloading a
+    table out to a stage) is deliberately not supported. Refused in a
+    read-only session, since it writes.
+
+    `create=True` creates the table first from the staged file's inferred
+    schema. It is off by default because a mistyped table name would then
+    quietly create a new table rather than failing, and inferred types are
+    usually wrong in ways that surface much later. It also needs a named
+    file format configured, because INFER_SCHEMA does not accept an
+    inline one.
+
+    The row count is reported from a before/after count rather than the
+    statement's own output, which over this path may be empty.
+    """
+    from . import staging
+
+    try:
+        prof = _profile_of(profile)
+        restriction = guard.SESSION.effective(prof)
+        if restriction.read_only:
+            return json.dumps(guard.refusal(restriction, "COPY"))
+        return json.dumps(
+            staging.load(prof, table, target,
+                         file_format=file_format or "", create=create),
+            default=str)
+    except staging.StagingError as e:
+        return json.dumps({"error": str(e), "error_type": "staging_refused"})
+    except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+        return _error(e)
+
+
+@server.tool()
 def stage_list(target: str, profile: str | None = None) -> str:
     """List what is staged at a target, e.g. `@~/exports`."""
     from . import staging

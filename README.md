@@ -455,6 +455,7 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
 | `describe_table(namespace, table, profile=None, shape=None)` | Columns, plus whether this is the table to use |
 | `stage_upload(local_path, target, profile=None)` | Put a local file where the source can read it |
+| `stage_load(table, target, profile=None, file_format=None, create=False)` | COPY INTO an existing table from a stage |
 | `stage_list(target, profile=None)` / `stage_remove(...)` | Inspect and clear a staging target |
 | `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None, estimate=False)` | Run SQL and return results |
 
@@ -746,11 +747,12 @@ annotation and the deprecated twin keeps looking clean.
 
 ```bash
 lakesh stage put  -p snowflake ./export.csv @~/exports
+lakesh stage load -p snowflake MY_TABLE @~/exports      # COPY INTO
 lakesh stage list -p snowflake @~/exports
 lakesh stage rm   -p snowflake @~/exports
 ```
 
-Over MCP: `stage_upload`, `stage_list`, `stage_remove`.
+Over MCP: `stage_upload`, `stage_load`, `stage_list`, `stage_remove`.
 
 The generic capability is "put a local file where this source can read
 it". Snowflake internal stages are implemented; DuckLake and Iceberg
@@ -779,6 +781,37 @@ driver and opened the local path — the ADBC driver is `dlopen`ed outside
 DuckDB's filesystem layer. The sandbox binds lakesh's engine; the
 allow-list binds the upload. `PUT`, `GET` and `REMOVE` are also writes to
 the gate, so a read-only session refuses them; `LIST` is a read.
+
+#### Loading a staged file
+
+`stage load` runs `COPY INTO`, from a stage into an **existing** table:
+
+```toml
+[profiles.snowflake]
+file_format       = "TYPE=CSV SKIP_HEADER=1"      # default for loads
+infer_file_format = "MYDB.FMTS.CSV_INFER"         # only needed for --create
+```
+
+Three deliberate limits:
+
+- **Load only.** `COPY INTO` runs in both directions on Snowflake, and
+  the unload form (`COPY INTO @stage FROM table`) writes table contents
+  out to a stage — an export path, not an import one. lakesh composes the
+  statement itself and requires the source to look like a stage, so the
+  direction cannot be inverted.
+- **The table must exist**, unless you pass `--create`. Off by default
+  because a mistyped table name would then quietly create a new table
+  instead of failing, and inferred types are usually wrong in ways that
+  surface much later. `--create` also needs `infer_file_format`, because
+  Snowflake's `INFER_SCHEMA` takes a **named** file format object and does
+  not accept an inline spec.
+- **The table name is validated, not escaped.** A table name cannot be a
+  bound parameter, so anything that is not `table`, `schema.table` or
+  `db.schema.table` is refused.
+
+The row count is reported from a before/after `count(*)` rather than the
+statement's own output, for the same reason uploads are verified by
+listing.
 
 **Uploads are verified by listing afterwards.** A `PUT` over this path
 returns its column names and no rows, so its own response cannot report

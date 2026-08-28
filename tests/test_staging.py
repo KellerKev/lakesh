@@ -239,3 +239,107 @@ def test_upload_confirms_by_listing(tmp_path, monkeypatch):
     result = staging.upload(prof, str(tmp_path / "f.csv"), "@~/t")
     assert result["verified"] is True
     assert result["local_bytes"] == 5
+
+
+# --------------------------------------------------------------------------
+# loading a staged file into a table
+
+
+def _sf(tmp_path, **kw):
+    return Profile(name="s", type="adbc", driver="snowflake", uri="x",
+                   upload_roots=(str(tmp_path),), **kw)
+
+
+@pytest.mark.parametrize("table", [
+    "t; DROP TABLE other", 't"', "t'", "a.b.c.d", "", "1abc", "t--x",
+])
+def test_a_table_name_that_is_not_an_identifier_is_refused(tmp_path, table):
+    """A table name cannot be a bound parameter, so it is interpolated —
+    and therefore validated rather than escaped."""
+    from lakesh import staging
+
+    with pytest.raises(staging.StagingError) as e:
+        staging.load(_sf(tmp_path), table, "@~/x")
+    assert "not a plain table name" in str(e.value)
+
+
+@pytest.mark.parametrize("table", ["t", "schema.t", "db.schema.t", "T$1"])
+def test_ordinary_table_names_are_accepted(tmp_path, monkeypatch, table):
+    from lakesh import staging
+
+    monkeypatch.setattr(staging, "_run", lambda p, sql: (["n"], [(0,)]))
+    assert staging.load(_sf(tmp_path), table, "@~/x")["table"] == table
+
+
+def test_the_unload_direction_is_refused(tmp_path):
+    """`COPY INTO @stage FROM table` writes table contents out to a stage
+    — an export path, not an import one. Requiring the source to look
+    like a stage keeps a caller from inverting the statement."""
+    from lakesh import staging
+
+    with pytest.raises(staging.StagingError) as e:
+        staging.load(_sf(tmp_path), "my_table", "other_table")
+    assert "unload direction is not supported" in str(e.value)
+
+
+@pytest.mark.parametrize("target", ["@~/x'", '@s";', "@s;DROP"])
+def test_a_stage_path_with_quoting_characters_is_refused(tmp_path, target):
+    from lakesh import staging
+
+    with pytest.raises(staging.StagingError):
+        staging.load(_sf(tmp_path), "t", target)
+
+
+def test_rows_loaded_comes_from_the_count_delta(tmp_path, monkeypatch):
+    """The statement's own output may be empty over this path — a PUT
+    returns no rows — so the count is the reliable signal."""
+    from lakesh import staging
+
+    counts = iter([(["n"], [(7,)]), (["x"], []), (["n"], [(9,)])])
+    monkeypatch.setattr(staging, "_run", lambda p, sql: next(counts))
+    result = staging.load(_sf(tmp_path), "t", "@~/x")
+    assert result["rows_loaded"] == 2
+    assert result["rows_after"] == 9
+
+
+def test_create_is_off_by_default(tmp_path, monkeypatch):
+    from lakesh import staging
+
+    monkeypatch.setattr(staging, "_run", lambda p, sql: (["n"], [(0,)]))
+    assert staging.load(_sf(tmp_path), "t", "@~/x")["created"] is False
+
+
+def test_create_needs_a_named_file_format(tmp_path):
+    """INFER_SCHEMA does not accept an inline format — verified against a
+    syntax error from the inline form and against the docs."""
+    from lakesh import staging
+
+    with pytest.raises(staging.StagingError) as e:
+        staging.load(_sf(tmp_path), "t", "@~/x", create=True)
+    assert "NAMED file format" in str(e.value)
+
+
+def test_create_runs_the_template_statement_when_configured(tmp_path, monkeypatch):
+    from lakesh import staging
+
+    seen = []
+
+    def _run(profile, sql):
+        seen.append(sql)
+        return (["n"], [(0,)]) if sql.startswith("SELECT count") else (["x"], [])
+
+    monkeypatch.setattr(staging, "_run", _run)
+    prof = _sf(tmp_path, infer_file_format="DB.FMTS.CSV_INFER")
+    result = staging.load(prof, "t", "@~/x", create=True)
+    assert result["created"] is True
+    assert any("USING TEMPLATE" in s and "INFER_SCHEMA" in s for s in seen)
+
+
+def test_an_engine_without_load_refuses(tmp_path):
+    from lakesh import staging
+
+    pg = Profile(name="pg", type="adbc", driver="postgresql", uri="x",
+                 upload_roots=(str(tmp_path),))
+    with pytest.raises(staging.StagingError) as e:
+        staging.load(pg, "t", "@~/x")
+    assert "no file staging" in str(e.value)

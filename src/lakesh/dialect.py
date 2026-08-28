@@ -60,6 +60,13 @@ class StageOps:
     list: Callable[[str], str]
     remove: Callable[[str], str]
     target_hint: str = "@stage or @~/path"
+    load: "Callable[[str, str, str], str] | None" = None
+    """(table, stage_target, file_format) -> SQL that loads a staged file
+    into an existing table. None means the engine cannot."""
+    default_format: str = ""
+    infer_create: "Callable[[str, str, str], str] | None" = None
+    """(table, stage_target, named_format) -> SQL creating the table from
+    the staged file's inferred schema. Opt-in only."""
     verify_after_put: bool = True
     """Whether the caller must confirm by listing.
 
@@ -69,6 +76,13 @@ class StageOps:
     own docs separately warn that a successful EXECUTION_STATUS does not
     mean files were transferred.
     """
+
+
+# Up to `db.schema.table`, each part a plain identifier. A table name
+# cannot be a bound parameter, so it is interpolated — and therefore has
+# to be validated rather than escaped.
+QUALIFIED_NAME_RE = __import__("re").compile(
+    r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){0,2}$")
 
 
 _SNOWFLAKE_STAGE = StageOps(
@@ -81,6 +95,18 @@ _SNOWFLAKE_STAGE = StageOps(
     list=lambda target: f"LIST {target}",
     remove=lambda target: f"REMOVE {target}",
     target_hint="@~/path, @my_stage or @db.schema.stage/path",
+    load=lambda table, target, fmt: (
+        f"COPY INTO {table} FROM {target} "
+        f"FILE_FORMAT=({fmt}) PURGE=FALSE"),
+    default_format="TYPE=CSV SKIP_HEADER=1",
+    # INFER_SCHEMA takes a NAMED file format object — inline specs are
+    # not supported — so auto-create only works when the operator names
+    # one they have already created. Verified against the docs and by a
+    # syntax error from the inline form.
+    infer_create=lambda table, target, named_fmt: (
+        f"CREATE TABLE IF NOT EXISTS {table} USING TEMPLATE ("
+        f"SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*)) FROM TABLE(INFER_SCHEMA("
+        f"LOCATION=>{_sf_quote(target)}, FILE_FORMAT=>{_sf_quote(named_fmt)})))"),
 )
 
 

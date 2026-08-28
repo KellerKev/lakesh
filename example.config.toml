@@ -28,6 +28,13 @@ default = "local"
 # upload_roots     = ["~/data/exports"]
 # max_upload_bytes = 104857600        # default 100 MB
 
+# File format for `stage load` (COPY INTO). Inline spec.
+# file_format = "TYPE=CSV SKIP_HEADER=1"
+# A NAMED file format object, required only for `stage load --create`:
+# Snowflake's INFER_SCHEMA does not accept an inline format.
+# infer_file_format = "MYDB.FMTS.CSV_INFER"
+
+
 
 
 # Your own masking patterns. Needs: pip install 'lakesh[mask]'
