@@ -42,6 +42,48 @@ from typing import Callable
 from .config import Profile
 
 
+def _sf_quote(value: str) -> str:
+    """Single-quoted literal for a Snowflake statement."""
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+@dataclass(frozen=True)
+class StageOps:
+    """How an engine moves a local file to where it can read it.
+
+    `put` takes an already-validated local path — `staging` owns deciding
+    whether lakesh is willing to read it, because that judgement is the
+    same on every engine.
+    """
+
+    put: Callable[[str, str], str]
+    list: Callable[[str], str]
+    remove: Callable[[str], str]
+    target_hint: str = "@stage or @~/path"
+    verify_after_put: bool = True
+    """Whether the caller must confirm by listing.
+
+    True for Snowflake, and not as belt-and-braces: measured, a PUT
+    through `adbc_scan` returns its column names and **no rows**, so the
+    response cannot tell you whether the transfer happened. Snowflake's
+    own docs separately warn that a successful EXECUTION_STATUS does not
+    mean files were transferred.
+    """
+
+
+_SNOWFLAKE_STAGE = StageOps(
+    # AUTO_COMPRESS=FALSE keeps the staged name equal to the local name,
+    # so the follow-up LIST can actually find it; with compression on,
+    # Snowflake appends .gz and the verification has to guess.
+    put=lambda local, target: (
+        f"PUT {_sf_quote('file://' + local)} {target} "
+        f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"),
+    list=lambda target: f"LIST {target}",
+    remove=lambda target: f"REMOVE {target}",
+    target_hint="@~/path, @my_stage or @db.schema.stage/path",
+)
+
+
 @dataclass(frozen=True)
 class Dialect:
     """One engine's capabilities. Absent capability = `None` or empty."""
@@ -68,6 +110,11 @@ class Dialect:
     derived table for paging or a count probe."""
     freshness_columns: str = ""
     freshness_join: str = ""
+    stage: "StageOps | None" = None
+    """How to stage a local file. None means the engine has no such
+    concept reachable over this path — DuckLake and Iceberg would stage
+    to object storage instead, which is a different implementation of the
+    same capability and not yet written."""
 
     def is_system_schema(self, name: str) -> bool:
         return str(name).lower() in self.system_schemas
@@ -127,6 +174,7 @@ _SNOWFLAKE = Dialect(
     unwrappable=(
         "explain", "pragma", "show", "desc", "describe", "list", "call",
         "use", "get", "put", "remove", "execute"),
+    stage=_SNOWFLAKE_STAGE,
 )
 
 _ANSI = Dialect(name="ansi")
@@ -228,3 +276,12 @@ def read_procedures_for(profile: Profile) -> frozenset[str]:
     dialect = for_profile(profile)
     declared = tuple(getattr(profile, "read_procedures", ()) or ())
     return frozenset(dialect.read_procedures | {n.lower() for n in declared})
+
+
+def stage_ops(profile: Profile) -> "StageOps | None":
+    """How to stage a file for this profile, or None if it cannot.
+
+    The caller reports "unavailable" with a reason rather than emitting a
+    `PUT` to an engine that has no such statement.
+    """
+    return for_profile(profile).stage

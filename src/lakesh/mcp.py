@@ -289,14 +289,30 @@ _HAS_ORDER_BY = re.compile(r"\border\s+by\b", re.IGNORECASE)
 _MAX_OFFSET = 100_000
 
 
-def _paginate(sql: str, limit: int, offset: int) -> tuple[str, bool]:
+def _is_unwrappable(sql: str, prof: Profile | None = None) -> bool:
+    """Whether `sql` is a statement that cannot sit in a derived table.
+
+    Per dialect, because the set differs: Snowflake adds `get`, `put`,
+    `remove` and `execute` to the common ones. Falls back to the shared
+    regex when no profile is in hand.
+    """
+    head = sql.strip().lstrip("(").split(None, 1)
+    if not head:
+        return False
+    if prof is None:
+        return bool(_UNWRAPPABLE.match(sql.strip().lstrip("(")))
+    return head[0].lower() in _dialect.for_profile(prof).unwrappable
+
+
+def _paginate(sql: str, limit: int, offset: int,
+              prof: Profile | None = None) -> tuple[str, bool]:
     """(statement, wrapped). `wrapped` false means the caller has to skip
     rows client-side, which transfers them and throws them away.
 
     At offset 0 the statement is returned byte-for-byte unchanged, so the
     common path is exactly what it was before pagination existed.
     """
-    if offset <= 0 or _UNWRAPPABLE.match(sql.strip().lstrip("(")):
+    if offset <= 0 or _is_unwrappable(sql, prof):
         return sql, False
     # `AS _lakesh_page` is required by Postgres < 16. The trailing `;` has
     # already been stripped by the caller, which is load-bearing: a
@@ -469,7 +485,9 @@ server = FastMCP(
         "dialect straight through, and table names are the source's own "
         "(e.g. SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY). Writes are disabled "
         "unless the operator set LAKESH_MCP_WRITE=1, and a profile marked "
-        "read_only refuses them either way. Call `session_status` to see "
+        "read_only refuses them either way. `stage_upload` puts a local "
+        "file where the source can read it, limited to directories the "
+        "operator allow-listed. Call `session_status` to see "
         "what this session is allowed to do, and `set_read_only` to give "
         "up write access for the rest of it."
     ),
@@ -572,6 +590,70 @@ def set_masking() -> str:
                  "control — SQL that transforms a value before lakesh sees "
                  "it defeats it."),
     })
+
+
+@server.tool()
+def stage_upload(local_path: str, target: str, profile: str | None = None) -> str:
+    """Upload a local file to the source's staging area.
+
+    Snowflake internal stages are supported; other engines report that
+    they cannot, rather than emitting a statement they do not have.
+
+    `local_path` must sit inside one of the profile's configured
+    `upload_roots`, and symlinks are resolved before that check. If the
+    operator has configured no roots, uploads are refused outright.
+    That fence is **not** the filesystem sandbox and does not depend on
+    it: the sandbox binds DuckDB's engine, while a stage upload is read
+    by the source's own driver, outside it.
+
+    The result is verified by listing the target afterwards, because a
+    PUT returns no rows over this path and so cannot report its own
+    success.
+    """
+    from . import staging
+
+    try:
+        prof = _profile_of(profile)
+        restriction = guard.SESSION.effective(prof)
+        if restriction.read_only:
+            return json.dumps(guard.refusal(restriction, "PUT"))
+        return json.dumps(staging.upload(prof, local_path, target), default=str)
+    except staging.StagingError as e:
+        return json.dumps({"error": str(e), "error_type": "staging_refused"})
+    except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+        return _error(e)
+
+
+@server.tool()
+def stage_list(target: str, profile: str | None = None) -> str:
+    """List what is staged at a target, e.g. `@~/exports`."""
+    from . import staging
+
+    try:
+        prof = _profile_of(profile)
+        return json.dumps({"target": target,
+                           "files": staging.listing(prof, target)}, default=str)
+    except staging.StagingError as e:
+        return json.dumps({"error": str(e), "error_type": "staging_refused"})
+    except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+        return _error(e)
+
+
+@server.tool()
+def stage_remove(target: str, profile: str | None = None) -> str:
+    """Remove staged files at a target. Refused in a read-only session."""
+    from . import staging
+
+    try:
+        prof = _profile_of(profile)
+        restriction = guard.SESSION.effective(prof)
+        if restriction.read_only:
+            return json.dumps(guard.refusal(restriction, "REMOVE"))
+        return json.dumps(staging.remove(prof, target), default=str)
+    except staging.StagingError as e:
+        return json.dumps({"error": str(e), "error_type": "staging_refused"})
+    except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
+        return _error(e)
 
 
 def _profile_of(profile: str | None) -> Profile:
@@ -1111,7 +1193,7 @@ def _estimate_query(
     native = mode == "native"
 
     if want == "count":
-        if _UNWRAPPABLE.match(sql.strip().lstrip("(")):
+        if _is_unwrappable(sql, prof):
             # A count probe wraps the statement in a derived table, which
             # a non-relational statement cannot survive. Saying so beats
             # emitting a syntax error.
@@ -1372,7 +1454,7 @@ def query(
     enforced = "best_effort" if (use_native and timeout) else (
         "hard" if timeout else "none"
     )
-    paged_sql, wrapped = _paginate(sql, limit, offset)
+    paged_sql, wrapped = _paginate(sql, limit, offset, prof)
     # One row past the limit, so "exactly `limit` rows" is distinguishable
     # from "more to come" instead of guessed at.
     want = limit + 1

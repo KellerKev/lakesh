@@ -20,6 +20,15 @@ default = "local"
 # check what a procedure does. DuckLake's read procedures ship as known.
 # read_procedures = ["my_reporting_proc"]
 
+# Staging: directories this profile may upload files from. Uploads are
+# refused unless this is set — an unconfigured allow-list means the
+# feature is off, not that everything is permitted. Symlinks are resolved
+# before the check. Note this is NOT the filesystem sandbox: a stage
+# upload is read by the source's driver, outside DuckDB's reach.
+# upload_roots     = ["~/data/exports"]
+# max_upload_bytes = 104857600        # default 100 MB
+
+
 
 # Your own masking patterns. Needs: pip install 'lakesh[mask]'
 # Compiled with RE2, which cannot backtrack — so an untrusted pattern

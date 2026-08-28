@@ -232,6 +232,12 @@ class Profile:
     """Override the engine guess. The guess reads the driver's basename,
     which is right almost always and wrong for an unusual layout — this
     is the escape hatch."""
+    upload_roots: tuple[str, ...] = ()
+    """Directories this profile may stage files from. Empty means uploads
+    are refused — an unconfigured allow-list means the feature is off, not
+    that everything is permitted."""
+    max_upload_bytes: int = 0
+    """0 uses the default in `staging`."""
     read_procedures: tuple[str, ...] = ()
     """Procedures the operator vouches for as reads, so `CALL` on them is
     allowed in a read-only session. A declaration, not a verification:
@@ -320,6 +326,11 @@ class Profile:
                     f"profile {self.name!r}: unknown dialect {self.dialect!r} "
                     f"(supported: {', '.join(known_dialects())})"
                 )
+        if self.max_upload_bytes < 0:
+            raise ConfigError(
+                f"profile {self.name!r}: `max_upload_bytes` cannot be "
+                f"negative (got {self.max_upload_bytes})"
+            )
         if self.status not in TABLE_STATUSES:
             raise ConfigError(
                 f"profile {self.name!r}: unknown status {self.status!r} "
@@ -655,6 +666,8 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         dialect=str(raw.get("dialect", "")),
         read_procedures=tuple(
             str(n) for n in (raw.get("read_procedures") or [])),
+        upload_roots=tuple(str(n) for n in (raw.get("upload_roots") or [])),
+        max_upload_bytes=int(raw.get("max_upload_bytes", 0) or 0),
         s3=s3,
         oauth=oauth,
     )
@@ -734,6 +747,15 @@ default = "local"
 # read-only session. A declaration, not a verification: lakesh cannot
 # check what a procedure does. DuckLake's read procedures ship as known.
 # read_procedures = ["my_reporting_proc"]
+
+# Staging: directories this profile may upload files from. Uploads are
+# refused unless this is set — an unconfigured allow-list means the
+# feature is off, not that everything is permitted. Symlinks are resolved
+# before the check. Note this is NOT the filesystem sandbox: a stage
+# upload is read by the source's driver, outside DuckDB's reach.
+# upload_roots     = ["~/data/exports"]
+# max_upload_bytes = 104857600        # default 100 MB
+
 
 
 # Your own masking patterns. Needs: pip install 'lakesh[mask]'

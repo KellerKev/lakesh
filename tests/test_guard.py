@@ -370,3 +370,26 @@ def test_sqlglot_can_only_tighten_never_permit():
     # The sqlglot call is the final return, i.e. reached only when nothing
     # else objected.
     assert source.rstrip().endswith("return _sqlglot_write(sql, dialect_name)")
+
+
+# --------------------------------------------------------------------------
+# file transfer
+
+
+@pytest.mark.parametrize("sql,verb", [
+    ("PUT 'file:///tmp/x.csv' @~/stage", "PUT"),
+    ("REMOVE @~/stage/f.csv", "REMOVE"),
+    # GET reads remotely but WRITES to local disk, and the filesystem
+    # sandbox does not cover driver-side file access. The asymmetry with
+    # PUT is deliberate.
+    ("GET @~/stage 'file:///tmp/out/'", "GET"),
+])
+def test_file_transfer_is_a_deliberate_write(sql, verb):
+    """These were already refused, but only because they do not begin
+    like a read. Naming them makes the refusal a decision."""
+    assert find_write(sql) == verb
+    assert blocks_write(sql) == verb
+
+
+def test_listing_a_stage_stays_a_read():
+    assert blocks_write("LIST @~/stage") is None

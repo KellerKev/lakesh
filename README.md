@@ -454,6 +454,8 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `list_namespaces(profile=None)` | List schemas in a profile's catalog |
 | `list_tables(profile=None, namespace=None)` | List tables, optionally scoped |
 | `describe_table(namespace, table, profile=None, shape=None)` | Columns, plus whether this is the table to use |
+| `stage_upload(local_path, target, profile=None)` | Put a local file where the source can read it |
+| `stage_list(target, profile=None)` / `stage_remove(...)` | Inspect and clear a staging target |
 | `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None, estimate=False)` | Run SQL and return results |
 
 ### Finding things — `search_objects`
@@ -739,6 +741,50 @@ already-open handle.
 Annotations are **unenforced assertions**: nothing checks that
 `ANALYTICS.FCT_REVENUE` still exists, so a rename silently drops its
 annotation and the deprecated twin keeps looking clean.
+
+### Staging local files
+
+```bash
+lakesh stage put  -p snowflake ./export.csv @~/exports
+lakesh stage list -p snowflake @~/exports
+lakesh stage rm   -p snowflake @~/exports
+```
+
+Over MCP: `stage_upload`, `stage_list`, `stage_remove`.
+
+The generic capability is "put a local file where this source can read
+it". Snowflake internal stages are implemented; DuckLake and Iceberg
+would stage to object storage, which is the same capability with a
+different backend and is not written yet. An engine without it says so
+rather than emitting a statement it does not have.
+
+**Uploads are refused unless you say where from.** There is no default:
+
+```toml
+[profiles.snowflake]
+upload_roots     = ["~/data/exports", "/tmp/lakesh"]
+max_upload_bytes = 104857600        # optional, defaults to 100 MB
+```
+
+An unconfigured allow-list means the feature is off, not that everything
+is permitted — a working directory is not a security boundary, and over
+MCP the caller is a model. Symlinks are resolved *before* the containment
+check, so a link inside an allowed root pointing at `/etc/passwd` is
+refused. Directories, FIFOs and oversized files are refused too.
+
+**This fence is not the filesystem sandbox, and does not depend on it.**
+Measured: with `disabled_filesystems='LocalFileSystem'` active and
+DuckDB's own `read_text('/etc/hosts')` refused, a `PUT` still reached the
+driver and opened the local path — the ADBC driver is `dlopen`ed outside
+DuckDB's filesystem layer. The sandbox binds lakesh's engine; the
+allow-list binds the upload. `PUT`, `GET` and `REMOVE` are also writes to
+the gate, so a read-only session refuses them; `LIST` is a read.
+
+**Uploads are verified by listing afterwards.** A `PUT` over this path
+returns its column names and no rows, so its own response cannot report
+success — and Snowflake's docs separately warn that a successful status
+does not mean files moved. If the file is not in the listing, the upload
+is reported as failed.
 
 ### Native SQL, per platform
 

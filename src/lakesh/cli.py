@@ -40,9 +40,11 @@ app = typer.Typer(
 config_app = typer.Typer(help="Manage the TOML config file.")
 profiles_app = typer.Typer(help="List + inspect configured profiles.")
 auth_app = typer.Typer(help="OAuth2 login + token cache management.")
+stage_app = typer.Typer(help="Stage local files where the source can read them.")
 app.add_typer(config_app, name="config")
 app.add_typer(profiles_app, name="profiles")
 app.add_typer(auth_app, name="auth")
+app.add_typer(stage_app, name="stage")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -667,3 +669,99 @@ def profiles_show(
 
 if __name__ == "__main__":
     app()
+
+
+# --------------------------------------------------------------------------
+# stage — put a local file where the source engine can read it
+
+
+def _stage_profile(profile, config_path):
+    cfg = _load_or_die(config_path)
+    try:
+        return cfg.get(profile)
+    except ConfigError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+
+
+@stage_app.command("put")
+def stage_put(
+    local: str = typer.Argument(..., help="Local file to upload."),
+    target: str = typer.Argument(..., help="Stage target, e.g. @~/exports."),
+    profile: Optional[str] = typer.Option(None, "-p", "--profile"),
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+):
+    """Upload a local file to the source's staging area.
+
+    The local path must sit inside one of the profile's `upload_roots`.
+    That check is not the filesystem sandbox and does not depend on it —
+    the sandbox binds DuckDB's engine, while a stage upload is read by
+    the driver, outside it.
+    """
+    from . import staging
+
+    prof = _stage_profile(profile, config_path)
+    secrets = profile_secrets(prof)
+    try:
+        result = staging.upload(prof, local, target)
+    except staging.StagingError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    except Exception as e:
+        err_console.print(f"[red]upload failed:[/red] {scrub(str(e), secrets)}")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[green]uploaded[/green] {result['uploaded']} "
+        f"({result['local_bytes']} bytes) -> {result['target']}"
+    )
+    for staged in result.get("staged", []):
+        console.print(f"  [dim]{staged}[/dim]")
+
+
+@stage_app.command("list")
+def stage_list(
+    target: str = typer.Argument(..., help="Stage target, e.g. @~/exports."),
+    profile: Optional[str] = typer.Option(None, "-p", "--profile"),
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+):
+    """List what is staged at a target."""
+    from . import staging
+
+    prof = _stage_profile(profile, config_path)
+    try:
+        files = staging.listing(prof, target)
+    except staging.StagingError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    except Exception as e:
+        err_console.print(f"[red]{scrub(str(e), profile_secrets(prof))}[/red]")
+        raise typer.Exit(code=1)
+    if not files:
+        console.print("[dim]nothing staged there[/dim]")
+        return
+    render_table(console, list(files[0]), [tuple(f.values()) for f in files])
+    console.print(f"[dim]{len(files)} file{'s' if len(files) != 1 else ''}[/dim]")
+
+
+@stage_app.command("rm")
+def stage_rm(
+    target: str = typer.Argument(..., help="Stage target to remove."),
+    profile: Optional[str] = typer.Option(None, "-p", "--profile"),
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+):
+    """Remove staged files at a target."""
+    from . import staging
+
+    prof = _stage_profile(profile, config_path)
+    try:
+        result = staging.remove(prof, target)
+    except staging.StagingError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    except Exception as e:
+        err_console.print(f"[red]{scrub(str(e), profile_secrets(prof))}[/red]")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[green]removed[/green] {result['removed']} from {result['target']} "
+        f"({result['remaining']} remaining)"
+    )

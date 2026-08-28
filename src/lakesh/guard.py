@@ -89,6 +89,16 @@ _WRITE_KEYWORDS = frozenset({
     "reset", "vacuum", "checkpoint",
     "commit", "rollback",
     "do", "execute", "exec",
+    # File transfer. `put` and `remove` change what is in a stage, so
+    # they are writes in the ordinary sense. `get` is the asymmetric one:
+    # it *reads* remotely but *writes* to local disk, and the filesystem
+    # sandbox does not cover driver-side file access — measured. So it is
+    # a write here even though it looks like the mirror of a read.
+    #
+    # All three were already refused, but only because they do not begin
+    # like a read. Naming them makes the refusal a decision and the
+    # message name the right verb.
+    "put", "get", "remove",
 })
 
 # Verbs whose read/write nature depends on what follows them, resolved by
