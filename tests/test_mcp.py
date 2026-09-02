@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from lakesh import mcp as lakesh_mcp
+from lakesh import duck as lakesh_duck
 
 
 URI = os.environ.get("LAKESH_TEST_URI", "http://127.0.0.1:8181")
@@ -138,7 +139,8 @@ def test_query_table_format(config_file):
     txt = lakesh_mcp.query("SELECT 1 AS a, 'hi' AS b", format="table")
     assert "a" in txt and "b" in txt
     assert "1" in txt and "hi" in txt
-    assert "(1 rows)" in txt or "(1 row)" in txt
+    # Footer carries the row count and the mode, e.g. "(1 rows, mode=duckdb)".
+    assert "(1 row" in txt
 
 
 @needs_live
@@ -179,6 +181,11 @@ default = "snow"
 type         = "adbc"
 driver       = "snowflake"
 token_option = "auth_token"
+
+[profiles.snow.options]
+# Required, and validated: without it the driver silently ignores the
+# bearer token and authenticates as whatever else the DSN carries.
+"adbc.snowflake.sql.auth_type" = "auth_oauth"
 
 [profiles.snow.oauth]
 grant                         = "device_code"
@@ -259,9 +266,8 @@ data_path    = "s3://b/p/"
 @pytest.fixture
 def fake_native(monkeypatch):
     con = _FakeNativeConnection()
-    monkeypatch.setattr(
-        lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1234)
-    )
+    # Patch where backend.open_session looks it up (duck.connect_native).
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1234))
     return con
 
 
@@ -377,7 +383,7 @@ def test_query_serializes_decimal_rows(adbc_config, monkeypatch):
         columns=("warehouse_name", "credits"),
         rows=[("ANALYTICS_WH", decimal.Decimal("170.54"))],
     )
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
     out = json.loads(lakesh_mcp.query("SELECT warehouse_name, credits FROM x"))
     assert out["rows"] == [{"warehouse_name": "ANALYTICS_WH", "credits": 170.54}]
 
@@ -402,7 +408,7 @@ def fake_search(monkeypatch):
         ("column", "ANALYTICS", "ORDERS", "REVENUE_USD", "NUMBER"),
         ("column", "ANALYTICS", "ORDERS", "REVENUE_LOCAL", "NUMBER"),
     ])
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
     return con
 
 
@@ -512,7 +518,7 @@ def test_search_objects_matched_on_is_a_sorted_list(adbc_config, monkeypatch):
         ("table", "ANALYTICS", "FCT_REVENUE", None, None),
         ("column", "ANALYTICS", "FCT_REVENUE", "REVENUE_USD", "NUMBER"),
     ])
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
     out = json.loads(lakesh_mcp.search_objects("revenue", profile="snow"))
     assert out["result_count"] == 1
     assert out["results"][0]["matched_on"] == ["column", "table"]
@@ -522,7 +528,7 @@ def test_search_objects_caps_columns_per_object(adbc_config, monkeypatch):
     con = _FakeNativeConnection(columns=_SEARCH_COLUMNS, rows=[
         ("column", "S", "WIDE", f"ID_{i}", "NUMBER") for i in range(25)
     ])
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
     out = json.loads(lakesh_mcp.search_objects("id", profile="snow"))
     result = out["results"][0]
     assert len(result["columns"]) == lakesh_mcp._MAX_COLUMNS_PER_OBJECT
@@ -537,7 +543,7 @@ def test_search_objects_truncates_with_a_sentinel_row(adbc_config, monkeypatch):
     con = _FakeNativeConnection(columns=_SEARCH_COLUMNS, rows=[
         ("table", "S", f"T{i}", None, None) for i in range(5)
     ])
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
 
     out = json.loads(lakesh_mcp.search_objects("t", profile="snow", limit=4))
     assert "LIMIT 5" in con.statements[0]
@@ -565,8 +571,8 @@ def test_search_objects_all_profiles_isolates_failures(adbc_config, monkeypatch)
         def close(self):
             pass
 
-    monkeypatch.setattr(lakesh_mcp, "connect_native", _connect_native)
-    monkeypatch.setattr(lakesh_mcp, "connect", lambda prof, **kw: _FakeDuckConnection())
+    monkeypatch.setattr(lakesh_duck, "connect_native", _connect_native)
+    monkeypatch.setattr(lakesh_duck, "connect", lambda prof, **kw: _FakeDuckConnection())
 
     out = json.loads(lakesh_mcp.search_objects("orders", all_profiles=True))
     assert [e["profile"] for e in out["errors"]] == ["snow"]
@@ -682,7 +688,7 @@ def test_query_has_more_is_exact(adbc_config, monkeypatch):
     """`truncated_at` cannot tell "exactly limit rows" from "truncated";
     `has_more` can, because a sentinel row is fetched."""
     con = _FakeNativeConnection(columns=("n",), rows=[(i,) for i in range(3)])
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
 
     out = json.loads(lakesh_mcp.query("SELECT n FROM t", profile="snow", limit=2))
     assert out["row_count"] == 2
@@ -712,7 +718,7 @@ def test_query_timeout_payload_is_typed(adbc_config, monkeypatch):
     def _boom(prof, **kw):
         raise QueryTimeout(3.0, 30.0, hard=False)
 
-    monkeypatch.setattr(lakesh_mcp, "connect_native", _boom)
+    monkeypatch.setattr(lakesh_duck, "connect_native", _boom)
     out = json.loads(lakesh_mcp.query("SELECT 1", profile="snow", timeout_s=3))
     assert out["error_type"] == "timeout"
     assert out["timeout_s"] == 3.0 and out["elapsed_s"] == 30.0
@@ -763,13 +769,21 @@ def test_idle_interrupt_does_not_poison_the_connection():
 
 
 def test_driver_timeout_sql_is_per_driver():
-    from lakesh.duck import _driver_timeout_sql
+    """The timeout statement comes from the dialect registry.
 
-    pg = _driver_timeout_sql("/x/libadbc_driver_postgresql.so", 3)
+    This used to exercise `duck._driver_timeout_sql`, a second copy of
+    the driver-name test that the registry replaced and which then sat
+    unreferenced by anything but this test.
+    """
+    from lakesh import dialect as d
+
+    pg = d.timeout_sql(d.get("postgres"), 3)
     assert "set_config('statement_timeout', '3000', false)" in pg
-    sf = _driver_timeout_sql("snowflake", 3)
+    sf = d.timeout_sql(d.get("snowflake"), 3)
     assert "STATEMENT_TIMEOUT_IN_SECONDS = 3" in sf
-    assert _driver_timeout_sql("sqlite", 3) is None
+    # SQLite falls to the ANSI profile, which claims no timeout it cannot
+    # deliver rather than guessing at a spelling.
+    assert d.timeout_sql(d.get("ansi"), 3) is None
 
 
 # --------------------------------------------------------------------------
@@ -796,7 +810,7 @@ catalog = "pg"
 """)
     monkeypatch.setenv("LAKESH_CONFIG", str(p))
     con = _FakeNativeConnection()
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
 
     out = json.loads(lakesh_mcp.query("SELECT * FROM t", estimate=True))
     assert out["method"] == "unavailable"
@@ -808,7 +822,7 @@ catalog = "pg"
 
 def test_estimate_count_builds_a_probe(adbc_config, monkeypatch):
     con = _FakeNativeConnection(columns=("n",), rows=[(4013113,)])
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
 
     out = json.loads(lakesh_mcp.query("SELECT * FROM t", estimate="count"))
     assert con.statements == ["SELECT count(*) AS n FROM (SELECT * FROM t) AS _lakesh_est"]
@@ -1065,7 +1079,7 @@ def pii_native(monkeypatch):
         columns=("email", "note"),
         rows=[("a@corp.com", "ref 12"), ("b@corp.com", "ref 13")],
     )
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
     return con
 
 
@@ -1138,7 +1152,7 @@ def test_explain_plan_is_masked(adbc_config, monkeypatch):
         columns=("plan",),
         rows=[("SEQ_SCAN users Filters: (email = 'alice@corp.com')",)],
     )
-    monkeypatch.setattr(lakesh_mcp, "connect_native", lambda prof, **kw: (con, 1))
+    monkeypatch.setattr(lakesh_duck, "connect_native", lambda prof, **kw: (con, 1))
     out = json.loads(lakesh_mcp.query(
         "SELECT * FROM users", profile="snow", estimate=True, mask="mask"))
     assert "alice@corp.com" not in json.dumps(out)
@@ -1149,3 +1163,43 @@ def test_session_status_reports_masking(adbc_config):
     lakesh_mcp.set_masking()
     status = json.loads(lakesh_mcp.session_status())
     assert status["masking"] == {"mode": "mask", "relaxable": False}
+
+
+# --------------------------------------------------------------------------
+# catalog-API search (pyiceberg / non-SQL sources)
+
+def test_like_matcher_substring_and_wildcards():
+    m = lakesh_mcp._like_matcher("%email%")     # %…% is a substring match
+    assert m("customer_email_addr") is True
+    assert m("phone") is False
+    # `_` is the single-char wildcard
+    assert lakesh_mcp._like_matcher("rev_nue")("revenue") is True
+
+
+def test_like_matcher_escape_makes_underscore_literal():
+    """search_objects escapes with '!', so '!_' means a real underscore,
+    not the single-char wildcard."""
+    m = lakesh_mcp._like_matcher("%rev!_enue%")
+    assert m("gross_rev_enue_x") is True        # contains a literal rev_enue
+    assert m("revXenue") is False               # X is not an underscore
+
+
+class _FakeMD:
+    def tables(self, namespace=None):
+        return [("analytics", "customers"), ("analytics", "orders")]
+    def columns(self, ns, tbl):
+        return {"customers": [("id", "long", False, 1), ("email", "string", True, 2)],
+                "orders": [("id", "long", False, 1), ("total", "double", True, 2)]}[tbl]
+
+
+def test_metadata_search_matches_tables_and_columns():
+    rows = lakesh_mcp._search_via_metadata(_FakeMD(), "%email%", None, "all")
+    assert ("column", "analytics", "customers", "email", "string") in rows
+    assert not any(r[0] == "table" for r in rows)   # no table named *email*
+
+
+def test_metadata_search_respects_match_kind():
+    rows = lakesh_mcp._search_via_metadata(_FakeMD(), "%orders%", None, "table")
+    assert rows == [("table", "analytics", "orders", None, None)]
+    # match=table must not return column hits
+    assert all(r[0] == "table" for r in rows)

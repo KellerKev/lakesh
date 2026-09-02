@@ -135,16 +135,21 @@ def _within(path: Path, root: Path) -> bool:
 
 
 def _run(profile, sql: str):
-    """Execute a stage statement against the source and return its rows."""
-    from .duck import adbc_native_scan, connect_native
+    """Execute a stage statement against the source and return its rows.
 
-    con, handle = connect_native(profile, interactive=False)
+    Routed by statement kind: `LIST` is a read and returns rows, while
+    `PUT`, `REMOVE` and `COPY INTO` are writes and run exactly once,
+    returning nothing. That loses COPY's per-file report, which was never
+    load-bearing here — the row-count delta is the signal `load` trusts,
+    for the same reason `upload` verifies by listing.
+    """
+    from .backend import open_session
+
+    session = open_session(profile, interactive=False, native=True)
     try:
-        cur = adbc_native_scan(con, handle, sql)
-        columns = [d[0] for d in cur.description] if cur.description else []
-        return columns, cur.fetchall()
+        return session.run(sql)
     finally:
-        con.close()
+        session.close()
 
 
 def _ops_or_raise(profile: Profile):

@@ -45,6 +45,43 @@ import duckdb
 from . import oauth
 from .config import ConfigError, Profile
 
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("lakesh")
+except Exception:                                   # pragma: no cover
+    # Running from a source tree with no installed dist. The version is
+    # cosmetic here — it only decorates a session label — so an unknown
+    # one must not stop a connection.
+    __version__ = "0"
+
+
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    """A DuckDB connection that says who it is on the wire.
+
+    `custom_user_agent` is appended to DuckDB's own User-Agent on every
+    HTTP request it makes — verified against a local listener, a request
+    arrives as::
+
+        duckdb/v1.5.2(osx_arm64) python/3.12 lakesh/0.1.0 mcp <hash>
+
+    That matters because on the Iceberg REST path this is the *only*
+    thing the far side can see. A catalog such as duckicelake gets to
+    distinguish lakesh from any other DuckDB client, and an agent-driven
+    session from a human one, without lakesh sending anything extra.
+
+    It has to be set at connect time: DuckDB refuses the setting once the
+    database is open ("Cannot change custom_user_agent setting while
+    database is running"), which is why this helper exists rather than a
+    `SET` alongside the other session statements.
+
+    Client-asserted like the rest of the session stamp — it is
+    attribution, not a control.
+    """
+    return duckdb.connect(
+        ":memory:", config={"custom_user_agent": f"lakesh/{__version__} {CALLER}"}
+    )
+
 
 def _host_without_scheme(endpoint: str) -> str:
     """DuckDB's S3 SECRET wants the host, not the full URL."""
@@ -205,7 +242,7 @@ def _adbc_attach_sql(profile: Profile, attach_opts: dict[str, str]) -> str:
 
 
 def _connect_adbc(profile: Profile, token: str | None) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(":memory:")
+    con = _duckdb_connect()
     load_adbc_scanner(con, required=True)
     secret_opts, attach_opts = _split_adbc_options(_adbc_options(profile, token))
     _install_adbc_secret(con, profile, secret_opts)
@@ -271,10 +308,71 @@ def adbc_native_handle(
 def adbc_native_scan(
     con: duckdb.DuckDBPyConnection, handle: int, sql: str
 ) -> duckdb.DuckDBPyConnection:
-    """Run `sql` on the source through an `adbc_connect` handle. The
-    statement rides as a bound parameter, so the source's own dialect
-    applies and DuckDB never parses it."""
+    """Run a **row-returning** `sql` on the source. The statement rides as
+    a bound parameter, so the source's dialect applies and DuckDB never
+    parses it.
+
+    ### This sends the statement to the source TWICE
+
+    `adbc_scan` is a DuckDB *table* function, and DuckDB binds a table
+    function before executing it — the bind runs the query to learn its
+    schema, then execution runs it again. Measured against Snowflake's
+    query history, one call here produces two `SUCCESS` rows:
+
+        73ms,  bytes_scanned=0          <- the bind
+        509ms, bytes_scanned=1,001,984  <- the real execution
+
+    For a read that is a wasted lightweight round trip and nothing worse.
+    **For anything with side effects it is a correctness bug** — measured,
+    one `INSERT INTO t VALUES (1)` lands two rows and one
+    `UPDATE … SET n = n + 1` moves the counter by two.
+
+    So: reads here, everything else through `adbc_native_exec`.
+    """
     return con.execute("SELECT * FROM adbc_scan(?, ?)", [handle, sql])
+
+
+def adbc_native_exec(
+    con: duckdb.DuckDBPyConnection, handle: int, sql: str
+) -> None:
+    """Run a statement on the source **exactly once**, discarding rows.
+
+    `adbc_execute` is a scalar function, so DuckDB has no schema to bind
+    and calls it once — verified, a counter incremented through here
+    moves by one where the same statement through `adbc_native_scan`
+    moves it by two.
+
+    The cost is that nothing comes back: a scalar cannot carry a result
+    set. That is the right trade for DML, whose status rows were never
+    trustworthy here anyway — a `PUT` through this driver already
+    returned its columns and no rows, which is why `staging` verifies by
+    listing afterwards rather than believing the response.
+    """
+    con.execute("SELECT adbc_execute(?, ?)", [handle, sql]).fetchall()
+
+
+def adbc_native_stmt(
+    con: duckdb.DuckDBPyConnection, handle: int, sql: str, *,
+    dialect_name: str = "",
+) -> tuple[list[str], list[tuple]]:
+    """Run caller-supplied `sql`, routed by whether it has side effects.
+
+    Reads go through `adbc_native_scan` and return their rows. Anything
+    that writes goes through `adbc_native_exec`, which runs it once and
+    returns nothing — because running it twice would apply it twice.
+
+    Classification reuses `guard.is_read_only`, the same judgement the
+    write gate already makes, so a statement cannot be a "read" for the
+    gate and a "write" here or the two would disagree about the same SQL.
+    """
+    from . import guard
+
+    if guard.is_read_only(sql):
+        cur = adbc_native_scan(con, handle, sql)
+        columns = [d[0] for d in cur.description] if cur.description else []
+        return columns, cur.fetchall()
+    adbc_native_exec(con, handle, sql)
+    return [], []
 
 
 # --------------------------------------------------------------------------
@@ -450,17 +548,19 @@ class QueryTimeout(Exception):
 
 
 @contextmanager
-def deadline(
-    con: duckdb.DuckDBPyConnection, seconds: float | None
-) -> Iterator[None]:
-    """Interrupt `con`'s in-flight statement after `seconds`.
+def deadline(target, seconds: float | None) -> Iterator[None]:
+    """Cancel `target`'s in-flight statement after `seconds`.
+
+    `target` is either a `Session` (cancelled via `.cancel()`) or a raw
+    `DuckDBPyConnection` (via `.interrupt()`) — existing callers pass the
+    connection, the migrated ones pass the session.
 
     The whole execute *and* fetch must happen inside the block:
     `adbc_scan` streams, so most of the wall clock is in the fetch.
 
-    Firing `interrupt()` with nothing running is a harmless no-op that
-    does not poison the next statement (verified on DuckDB 1.5.2), so
-    the race between the final fetch and `timer.cancel()` needs no lock.
+    Firing the cancel with nothing running is a harmless no-op that does
+    not poison the next statement (verified on DuckDB 1.5.2), so the race
+    between the final fetch and `timer.cancel()` needs no lock.
     """
     if not seconds or seconds <= 0:
         yield
@@ -471,7 +571,8 @@ def deadline(
     def _fire() -> None:
         fired.set()
         try:
-            con.interrupt()
+            cancel = getattr(target, "cancel", None)
+            (cancel or target.interrupt)()
         except Exception:      # already closed — nothing left to abort
             pass
 
@@ -495,6 +596,17 @@ def deadline(
             raise
         elapsed = time.monotonic() - started
         raise QueryTimeout(seconds, elapsed, hard=False) from e
+    except Exception as e:
+        # A non-DuckDB backend (a Python DB-API driver) raises its own
+        # exception type when cancelled — one lakesh cannot enumerate. If
+        # the watchdog fired, the deadline was genuinely exceeded, so
+        # relabel it; otherwise it is a real error and propagates.
+        if not fired.is_set():
+            raise
+        if isinstance(e, (QueryTimeout,)):
+            raise
+        elapsed = time.monotonic() - started
+        raise QueryTimeout(seconds, elapsed, hard=False) from e
     finally:
         timer.cancel()
 
@@ -504,26 +616,6 @@ def _timeout_sql_for(profile: Profile, seconds: float) -> str | None:
     from . import dialect as _dialect
 
     return _dialect.timeout_sql(_dialect.for_profile(profile), seconds)
-
-
-def _driver_timeout_sql(driver: str, seconds: float) -> str | None:
-    """The source's own statement timeout, when it has one we can set
-    over the same connection. Matching is a substring test because
-    `driver` is usually a path to a shared library."""
-    d = driver.lower()
-    if "postgres" in d:
-        # Verified: returns ('3s',) and the next statement dies with
-        # "canceling statement due to statement timeout". Note the
-        # driver pays the timeout twice — once on PREPARE and once on
-        # COPY — so wall clock is 2x what is configured. Don't halve it
-        # to compensate: the multiplier is a driver detail, and the
-        # error reports what actually happened.
-        return f"SELECT set_config('statement_timeout', '{int(seconds * 1000)}', false)"
-    if "snowflake" in d:
-        # Reasoned from the docs, not yet measured against an account —
-        # callers are told `best_effort` until it is.
-        return f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {int(seconds)}"
-    return None
 
 
 def arm_driver_timeout(
@@ -542,10 +634,193 @@ def arm_driver_timeout(
     if not sql:
         return False
     try:
-        adbc_native_scan(con, handle, sql).fetchall()
+        adbc_native_exec(con, handle, sql)
         return True
     except Exception:
         return False
+
+
+# Who is driving this process. A lakesh process is either a CLI
+# invocation or an MCP server for its whole life — the same
+# process-equals-session property the MCP tools already rely on for
+# `SESSION` state — so this is set once at the entry point rather than
+# threaded through `staging`, `cli` and `mcp` to every connect call.
+CALLER = "cli"
+
+LAST_STAMP: dict | None = None
+"""What the most recent connection stamped, for `session_status` and
+`profiles show --probe` to report. Same reasoning as `LAST_SANDBOX_SKIP`:
+a governance measure you believe is active but isn't is worse than none,
+so the reporting surfaces read the outcome rather than the config."""
+
+
+def _record(out: dict) -> dict:
+    """Publish the outcome for the reporting surfaces.
+
+    Every return path goes through here. An early return that skipped it
+    left `LAST_STAMP` holding the *previous* connection's result, so
+    `--probe` cheerfully reported a stamp that this connection never
+    made — the exact confusion the field exists to prevent.
+    """
+    global LAST_STAMP
+    LAST_STAMP = out
+    return out
+
+
+def _statement_runner(con: duckdb.DuckDBPyConnection, handle: int | None):
+    """How to issue a side-effecting statement on this connection.
+
+    `handle is None` means the engine is DuckDB itself — DuckLake,
+    Iceberg REST, duckicelake — where there is no ADBC handle and the
+    statement runs locally. Everything else goes to the source through
+    `adbc_native_exec`, which runs it exactly once.
+    """
+    if handle is None:
+        return lambda sql: con.execute(sql)
+    return lambda sql: adbc_native_exec(con, handle, sql)
+
+
+def stamp_session(
+    con: duckdb.DuckDBPyConnection, handle: int | None, profile: Profile,
+    caller: str,
+) -> dict:
+    """Tell the source who is driving this connection. Best-effort.
+
+    ### Why this has to happen here
+
+    A session label does not survive a new connection — measured on both
+    Snowflake and Postgres — and lakesh opens one per call. So the stamp
+    belongs at connect time, next to `arm_driver_timeout`, which is here
+    for exactly the same reason.
+
+    ### What it is and is not
+
+    It is attribution: the engine's audit trail learns that a query came
+    from lakesh, and whether a human at the CLI or an agent over MCP
+    asked for it. On Snowflake that is `QUERY_TAG` plus a
+    `LAKESH_CLIENT` session variable, and a masking policy *can* read the
+    latter — verified by creating one.
+
+    It is **not** a security control, and a policy built on it is weaker
+    than it looks: the credentials that set `LAKESH_CLIENT = 'mcp'` can
+    set it to anything. Snowflake's `IS_AGENT_ACTIVATED` is the
+    trustworthy version precisely because it is derived from how the
+    session authenticated rather than asserted by the client — lakesh can
+    read it (see `session_probe`) but nothing can set it.
+
+    Best-effort for the same reason as the timeout: failing a query
+    because a label would not stick is worse than an unlabelled query.
+    """
+    from . import dialect as _dialect
+
+    if not getattr(profile, "session_context", True):
+        return _record({"stamped": False, "reason": "disabled for this profile"})
+    d = _dialect.for_profile(profile)
+    if d.session is None:
+        return _record({"stamped": False,
+                        "reason": f"{d.name} has no session context to set"})
+    if handle is None and d.name != "duckdb":
+        # Local execution, but the dialect emits SQL for a remote engine.
+        # An ADBC profile reached through ATTACH has no handle to send it
+        # down, so the statements would run against DuckDB, fail, and be
+        # swallowed by the best-effort catch below — a stamp that looks
+        # applied and is not. Say so instead.
+        return _record({
+            "stamped": False,
+            "reason": f"a {d.name} profile cannot be stamped over the "
+                      f"attached-catalog path; use --native, which has a "
+                      f"handle to send the statement down",
+        })
+
+    label = getattr(profile, "query_tag", "") or f"lakesh/{__version__} {caller}"
+    variables = {"client": caller}
+    variables.update(getattr(profile, "session_variables", None) or {})
+
+    run = _statement_runner(con, handle)
+    applied, failed = [], []
+    for sql in _dialect.session_stamp_sql(d, label, variables):
+        try:
+            run(sql)
+            applied.append(sql)
+        except Exception:
+            failed.append(sql)
+    out = {
+        "stamped": bool(applied),
+        "caller": caller,
+        "label": label,
+        "variables": variables,
+        # Named rather than counted: a stamp that silently half-applied
+        # would leave an operator debugging a policy that never fires.
+        "rejected": len(failed),
+    }
+    out["attested"] = _attest(con, handle, profile, d, caller)
+    return _record(out)
+
+
+def _attest(con, handle, profile: Profile, d, caller: str) -> dict | None:
+    """Publish a signed attestation, when the profile is set up for one.
+
+    **Not best-effort, unlike the stamp above.** A stamp that fails costs
+    an audit label; an attestation that fails means a fail-closed policy
+    masks everything, and the caller needs to know that happened rather
+    than discovering it as mysteriously empty columns. So the reason is
+    always reported, and a *configured* attestation that fails raises.
+    """
+    from . import attest as _attest_mod
+
+    cfg = _attest_mod.signing_config(profile)
+    if cfg is None:
+        return None
+    if handle is None or d.session is None or not d.session.attest \
+            or not d.session.session_id:
+        raise ConfigError(
+            f"profile {profile.name!r} configures `[signing]`, but "
+            f"{d.name} has no way to carry a signed attestation. Remove the "
+            f"block or point the profile at a source that does (Snowflake)."
+        )
+    # Bound to this session, so a token lifted out of query history is
+    # useless anywhere else. Costs one round trip; that is the price of
+    # the token being logged.
+    rows = adbc_native_scan(con, handle, d.session.session_id).fetchall()
+    if not rows or rows[0][0] is None:
+        raise _attest_mod.SigningError(
+            f"profile {profile.name!r}: the source did not return a session "
+            f"id, so the attestation cannot be bound to this session"
+        )
+    session_id = str(rows[0][0])
+    token = _attest_mod.mint(profile, caller, session_id)
+    adbc_native_exec(con, handle, d.session.attest(token))
+    return {
+        "method": getattr(cfg, "method", "hmac"),
+        "kid": cfg.kid,
+        "bound_to_session": session_id,
+        "caller": caller,
+    }
+
+
+def session_probe(
+    con: duckdb.DuckDBPyConnection, handle: int | None, profile: Profile,
+) -> dict | None:
+    """What the source says about this session, or None if it cannot say.
+
+    None rather than an empty dict, and a missing key rather than a false
+    one: an agent reading "not agent-activated" off an engine that has no
+    such concept would be reading a fact that was never established.
+    """
+    from . import dialect as _dialect
+
+    sql = _dialect.session_probe_sql(profile)
+    if not sql:
+        return None
+    try:
+        cur = con.execute(sql) if handle is None else adbc_native_scan(con, handle, sql)
+        rows = cur.fetchall()
+        if not rows:
+            return None
+        names = [d[0].lower() for d in cur.description]
+        return {k: v for k, v in zip(names, rows[0]) if v is not None}
+    except Exception:
+        return None
 
 
 def connect_native(
@@ -554,12 +829,14 @@ def connect_native(
     token: str | None = None,
     interactive: bool = True,
     timeout_s: float | None = None,
+    caller: str | None = None,
 ) -> tuple[duckdb.DuckDBPyConnection, int]:
     """(connection, handle) for native passthrough — no ATTACH, so none
     of the eager catalog population happens.
 
     `timeout_s` additionally arms the source's own statement timeout
-    where the driver has one; see `arm_driver_timeout`."""
+    where the driver has one; see `arm_driver_timeout`. `caller` labels
+    the session as human- or agent-driven; see `stamp_session`."""
     profile.validate()
     if profile.type != "adbc":
         raise ConfigError(
@@ -568,7 +845,7 @@ def connect_native(
         )
     if token is None:
         token = oauth.get_token(profile, interactive=interactive)
-    con = duckdb.connect(":memory:")
+    con = _duckdb_connect()
     load_adbc_scanner(con, required=True)
     try:
         handle = adbc_native_handle(con, profile, token)
@@ -576,12 +853,13 @@ def connect_native(
         con.close()
         raise
     arm_driver_timeout(con, handle, profile, timeout_s)
+    stamp_session(con, handle, profile, caller or CALLER)
     _sandbox(con, profile)
     return con, handle
 
 
 def _connect_iceberg_rest(profile: Profile, token: str | None) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(":memory:")
+    con = _duckdb_connect()
     for ext in ("httpfs", "iceberg"):
         con.execute(f"INSTALL {ext}")
         con.execute(f"LOAD {ext}")
@@ -607,8 +885,33 @@ def _connect_iceberg_rest(profile: Profile, token: str | None) -> duckdb.DuckDBP
     return con
 
 
+def _dsn_with_app_name(dsn: str) -> str:
+    """Add `application_name` to a libpq DSN if it has none.
+
+    DuckLake's metadata lives in Postgres, so its metastore can attribute
+    connections exactly like a direct Postgres profile does — the label
+    lands in `pg_stat_activity`. Nothing else on the DuckLake path
+    reaches a server that could report who is asking.
+
+    Both DSN spellings are handled: keyword/value (`host=... dbname=...`)
+    and URI (`postgresql://...`). An operator who already set the
+    parameter keeps their value.
+    """
+    if not dsn or "application_name" in dsn:
+        return dsn
+    # No spaces in the value. The DSN is interpolated into
+    # `ATTACH 'ducklake:postgres:<dsn>'`, so a libpq-quoted value would
+    # need single quotes and those terminate the SQL string literal --
+    # measured, it fails with `syntax error at or near "lakesh"`.
+    label = f"lakesh/{__version__}-{CALLER}"
+    if dsn.startswith(("postgres://", "postgresql://")):
+        sep = "&" if "?" in dsn else "?"
+        return f"{dsn}{sep}application_name={label}"
+    return f"{dsn} application_name={label}"
+
+
 def _connect_ducklake(profile: Profile) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(":memory:")
+    con = _duckdb_connect()
     for ext in ("ducklake", "postgres", "httpfs"):
         con.execute(f"INSTALL {ext}")
         con.execute(f"LOAD {ext}")
@@ -619,7 +922,7 @@ def _connect_ducklake(profile: Profile) -> duckdb.DuckDBPyConnection:
     # DuckLake URI: `ducklake:postgres:<libpq DSN>`. The catalog is
     # attached under the profile's `catalog` alias (default "lake"),
     # which is what `\l` / `\d` see as the top-level qualifier.
-    uri = f"ducklake:postgres:{profile.postgres_dsn}"
+    uri = f"ducklake:postgres:{_dsn_with_app_name(profile.postgres_dsn)}"
     # Session TZ pinned to UTC so TIMESTAMPTZ stats / partition bounds
     # don't shift by the local offset — matches the guidance in
     # duckicelake's OPERATIONS doc.
@@ -654,14 +957,14 @@ def connect(
     """
     profile.validate()
     if profile.type == "ducklake":
-        return _connect_ducklake(profile)
+        return _stamped(_connect_ducklake(profile), profile)
 
     supplied = token is not None
     if token is None:
         token = oauth.get_token(profile, interactive=interactive)
     builder = _connect_adbc if profile.type == "adbc" else _connect_iceberg_rest
     try:
-        return builder(profile, token)
+        return _stamped(builder(profile, token), profile)
     except duckdb.Error as e:
         # A cached token can be expiry-valid but server-revoked. Drop the
         # cache entry and retry once with a freshly acquired token.
@@ -669,7 +972,19 @@ def connect(
             raise
         oauth.TokenCache().clear(profile.name)
         token = oauth.get_token(profile, interactive=interactive)
-        return builder(profile, token)
+        return _stamped(builder(profile, token), profile)
+
+
+def _stamped(con: duckdb.DuckDBPyConnection, profile: Profile):
+    """Label an ATTACH-path connection, then hand it back.
+
+    The native path stamps inside `connect_native`; this is the other
+    half. Without it a DuckLake or Iceberg profile got no session context
+    at all, and an ADBC profile got one only when it happened to be used
+    natively — which looked like the feature working.
+    """
+    stamp_session(con, None, profile, CALLER)
+    return con
 
 
 def catalog_alias(profile: Profile) -> str:

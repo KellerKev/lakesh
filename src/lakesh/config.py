@@ -91,6 +91,50 @@ OAUTH_GRANTS = ("client_credentials", "device_code", "authorization_code")
 
 
 @dataclass
+class SigningConfig:
+    """How this profile proves to the source that lakesh is asking.
+
+    Absent means the session stamp stays client-asserted, which is the
+    default and is fine for attribution. Present means lakesh signs a
+    short-lived token a masking policy can verify. See `attest`.
+    """
+
+    method: str = "hmac"
+    """`hmac` (default) or `ecdsa`.
+
+    Measured through a real masking policy over 1M rows: `hmac` verifies
+    in pure SQL at 0.41s against a 0.20s no-policy floor, while `ecdsa`
+    needs a Python UDF at 2.75s. `hmac` is the default because 2.5s on
+    every query is a tax an agentic tool pays constantly.
+
+    The trade is that `hmac` is symmetric — whoever can read the secret
+    can forge a proof — so the generator keeps it in an RBAC-protected
+    table rather than in any DDL. Choose `ecdsa` when the requirement is
+    that the source hold nothing forgeable at all."""
+    kid: str = ""
+    """Key id. The Snowflake-side verifier maps it to a trust label, so
+    this — not any claim the client makes — is what decides what the
+    session is allowed to see."""
+    key_file: str = ""
+    key_env: str = ""
+    key_keychain: str = ""
+    """Private key sources, checked in that order. Explicit beats ambient:
+    a path someone wrote in the config outranks an environment variable
+    that may have been inherited from anywhere."""
+    ttl_s: int = 0
+    """Token lifetime for `ecdsa`; 0 means `attest.DEFAULT_TTL_S`. Short
+    on purpose — the token is written to the source's query history.
+
+    Ignored by `hmac`, whose proof carries no timestamp: the session is
+    the expiry boundary there, and a clock dependency between client and
+    source would mask everything on skew. See `attest.mint_proof`."""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.key_file or self.key_env or self.key_keychain)
+
+
+@dataclass
 class OAuthConfig:
     grant: str = "client_credentials"
     client_id: str | None = None
@@ -116,7 +160,7 @@ class OAuthConfig:
         return bool(self.client_id)
 
 
-SUPPORTED_TYPES = ("iceberg-rest", "ducklake", "adbc")
+SUPPORTED_TYPES = ("iceberg-rest", "ducklake", "adbc", "python")
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -210,6 +254,11 @@ class Profile:
     `{token}` placeholder replaced with the OAuth bearer token."""
     token_option: str = ""
     """Which ADBC option key receives the OAuth bearer token."""
+    backend: str = ""
+    """For `type = "python"`: which Python query backend serves this
+    profile. A shipped name (`duckdb`, `snowflake`, `postgres`, `dbapi`)
+    or a `"module:callable"` import path to a user factory. `options` are
+    passed to the driver's `connect()`. See `lakesh.backend`."""
     read_only: bool = False
     query_timeout_s: float | None = None
     """Per-query deadline. When set this is a *ceiling*: a caller may ask
@@ -232,6 +281,23 @@ class Profile:
     """Override the engine guess. The guess reads the driver's basename,
     which is right almost always and wrong for an unusual layout — this
     is the escape hatch."""
+    session_context: bool = True
+    """Whether to label sessions with who is driving lakesh.
+
+    On by default, unlike `upload_roots`, because the two defaults answer
+    opposite questions: an allow-list governs what lakesh may *do*, and
+    this only adds a label to a session lakesh was going to open anyway.
+    Off is for an engine that rejects the statement or an operator whose
+    own tooling owns `QUERY_TAG`."""
+    query_tag: str = ""
+    """Override the session label. Empty means `lakesh/<version> <caller>`."""
+    signing: "SigningConfig | None" = None
+    """Signed attestation. None means the stamp stays client-asserted."""
+    session_variables: dict[str, str] = field(default_factory=dict)
+    """Extra session variables to set alongside `client`, e.g. a team or
+    cost-centre. Names must be plain identifiers; each engine applies its
+    own namespace prefix. These are client-asserted like everything else
+    here — see `dialect.SessionContext`."""
     upload_roots: tuple[str, ...] = ()
     """Directories this profile may stage files from. Empty means uploads
     are refused — an unconfigured allow-list means the feature is off, not
@@ -323,6 +389,20 @@ class Profile:
                     f"bearer token) or a \"{{token}}\" placeholder in an "
                     f"option value"
                 )
+            self._check_snowflake_oauth()
+        elif self.type == "python":
+            if not self.backend:
+                raise ConfigError(
+                    f"profile {self.name!r}: python profile requires "
+                    f"`backend` — a shipped name (duckdb, snowflake, "
+                    f"postgres, dbapi) or a \"module:callable\" import path"
+                )
+            if not self.dialect:
+                raise ConfigError(
+                    f"profile {self.name!r}: python profile requires "
+                    f"`dialect` — there is no driver path to guess "
+                    f"capabilities from (e.g. dialect = \"snowflake\")"
+                )
         # Type-agnostic: annotations apply to every profile type.
         if self.dialect:
             from .dialect import known_dialects
@@ -330,6 +410,48 @@ class Profile:
                 raise ConfigError(
                     f"profile {self.name!r}: unknown dialect {self.dialect!r} "
                     f"(supported: {', '.join(known_dialects())})"
+                )
+        if self.session_variables:
+            from .dialect import BARE_NAME_RE
+            for key in self.session_variables:
+                if not BARE_NAME_RE.match(key):
+                    raise ConfigError(
+                        f"profile {self.name!r}: session variable {key!r} is "
+                        f"not a plain identifier. Use letters, digits and "
+                        f"underscores — lakesh adds each engine's own "
+                        f"namespace prefix, so a qualified name would "
+                        f"collide with it."
+                    )
+                if key.lower() == "client":
+                    raise ConfigError(
+                        f"profile {self.name!r}: `client` is set by lakesh to "
+                        f"name the caller (mcp or cli) and cannot be "
+                        f"overridden — an overridable caller label would be "
+                        f"worthless to a policy. Use a different name."
+                    )
+        if self.signing is not None:
+            s = self.signing
+            if not s.enabled:
+                raise ConfigError(
+                    f"profile {self.name!r}: `[signing]` needs one of "
+                    f"`key_file`, `key_env` or `key_keychain`. An empty block "
+                    f"would leave signing off while looking configured."
+                )
+            if not s.kid:
+                raise ConfigError(
+                    f"profile {self.name!r}: `[signing]` needs a `kid`. The "
+                    f"verifier maps it to a trust label, so a token without "
+                    f"one can never be recognised."
+                )
+            if s.ttl_s < 0:
+                raise ConfigError(
+                    f"profile {self.name!r}: `signing.ttl_s` cannot be negative"
+                )
+            from .attest import METHODS
+            if s.method not in METHODS:
+                raise ConfigError(
+                    f"profile {self.name!r}: unknown signing method "
+                    f"{s.method!r} (supported: {', '.join(METHODS)})"
                 )
         if self.max_upload_bytes < 0:
             raise ConfigError(
@@ -350,6 +472,36 @@ class Profile:
                 )
         if self.oauth.enabled and self.type != "ducklake":
             self._validate_oauth()
+
+    def _check_snowflake_oauth(self) -> None:
+        """Snowflake needs `auth_type` set, or it ignores the token.
+
+        Measured, and the reason this is a hard error rather than a note
+        in the docs: with `client_option.auth_token` supplied but
+        `auth_type` left unset, the driver **silently discards the token**
+        and authenticates with whatever else the DSN carries. A deliberate
+        garbage token connected fine that way.
+
+        There is no error to debug from — the session simply is not the
+        one you configured. That matters most for the case OAuth is
+        usually being set up for here: an `IS_AGENTIC = TRUE` security
+        integration, where the symptom is agent policies quietly never
+        firing.
+        """
+        if not (self.oauth.enabled and self.token_option):
+            return
+        if "snowflake" not in os.path.basename(self.driver or "").lower():
+            return
+        key = "adbc.snowflake.sql.auth_type"
+        if self.options.get(key, "").lower() == "auth_oauth":
+            return
+        raise ConfigError(
+            f"profile {self.name!r}: a Snowflake profile using oauth must set "
+            f'`options."{key}" = "auth_oauth"`. Without it the driver ignores '
+            f"the bearer token and authenticates as whatever else the DSN "
+            f"carries — it connects, so there is no error to notice, and the "
+            f"session is not the one you configured."
+        )
 
     def _validate_oauth(self) -> None:
         o = self.oauth
@@ -434,6 +586,31 @@ def default_config_path() -> Path:
 
 # --------------------------------------------------------------------------
 # load + parse
+
+def _parse_signing(name: str, raw: Any) -> "SigningConfig | None":
+    """The `[signing]` block, or None when the profile has none."""
+    if not raw:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"profile {name!r}: `signing` must be a table")
+    unknown = set(raw) - {"method", "kid", "key_file", "key_env",
+                          "key_keychain", "ttl_s"}
+    if unknown:
+        # Rejected rather than ignored: a typo'd `key_path` would leave
+        # signing silently off, which looks exactly like it working.
+        raise ConfigError(
+            f"profile {name!r}: unknown key(s) in `[signing]`: "
+            f"{', '.join(sorted(unknown))}"
+        )
+    return SigningConfig(
+        method=str(raw.get("method", "hmac")).lower(),
+        kid=str(raw.get("kid", "")),
+        key_file=str(raw.get("key_file", "")),
+        key_env=str(raw.get("key_env", "")),
+        key_keychain=str(raw.get("key_keychain", "")),
+        ttl_s=int(raw.get("ttl_s", 0) or 0),
+    )
+
 
 def _resolve_env(value: Any, env_key: Any) -> Any:
     """Given a pair of (literal, literal_from_env), return whichever is set.
@@ -656,6 +833,7 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         driver=str(raw.get("driver", "")),
         options=_parse_options(options_raw),
         token_option=str(raw.get("token_option", "")),
+        backend=str(raw.get("backend", "")),
         read_only=bool(raw.get("read_only", False)),
         query_timeout_s=_parse_timeout(name, raw.get("query_timeout_s")),
         status=str(raw.get("status", "unknown")),
@@ -671,6 +849,11 @@ def _parse_profile(name: str, raw: dict) -> Profile:
         dialect=str(raw.get("dialect", "")),
         read_procedures=tuple(
             str(n) for n in (raw.get("read_procedures") or [])),
+        session_context=bool(raw.get("session_context", True)),
+        query_tag=str(raw.get("query_tag", "")),
+        signing=_parse_signing(name, raw.get("signing")),
+        session_variables={
+            str(k): str(v) for k, v in (raw.get("session_variables") or {}).items()},
         upload_roots=tuple(str(n) for n in (raw.get("upload_roots") or [])),
         max_upload_bytes=int(raw.get("max_upload_bytes", 0) or 0),
         file_format=str(raw.get("file_format", "")),
@@ -896,6 +1079,10 @@ path_style = true
 #
 # [profiles.snow.options]
 # "adbc.snowflake.sql.account" = "myorg-account1"
+# # REQUIRED with oauth, and validated at load. Without it the driver
+# # silently ignores the bearer token and authenticates as whatever else
+# # the DSN carries — it connects, so there is no error to notice.
+# "adbc.snowflake.sql.auth_type" = "auth_oauth"
 #
 # [profiles.snow.oauth]
 # grant                         = "device_code"
@@ -903,4 +1090,102 @@ path_style = true
 # device_authorization_endpoint = "https://idp.example.com/oauth2/v1/device/authorize"
 # token_endpoint                = "https://idp.example.com/oauth2/v1/token"
 # scope                         = "session:role:ANALYST offline_access"
+
+# --- Session context: telling the source who is asking -------------------
+# On by default. lakesh labels every session it opens with whether a
+# human (cli) or an agent (mcp) is driving, so the engine's audit trail
+# can tell them apart. On Snowflake that is QUERY_TAG plus a
+# LAKESH_CLIENT session variable; on Postgres, application_name plus
+# lakesh.client.
+#
+# This is ATTRIBUTION, NOT ACCESS CONTROL. The value is client-asserted:
+# the same credentials that set LAKESH_CLIENT = 'mcp' can set it to
+# anything. A masking policy may read it (verified — GETVARIABLE works in
+# a policy body), but it is trusting the client to be honest.
+#
+# Session context reaches more than Snowflake. Postgres gets
+# application_name + lakesh.client (visible in pg_stat_activity); a
+# DuckLake metastore is labelled through its DSN; an Iceberg REST
+# catalog such as duckicelake sees lakesh in the HTTP User-Agent. On
+# DuckDB-hosted engines the variable is process-local -- nothing
+# server-side reads it. ADBC profiles used WITHOUT --native have no
+# handle to send the statement down and report that honestly.
+#
+# Snowflake's IS_AGENT_ACTIVATED is the trustworthy version, because it
+# is derived from how the session authenticated and no client can set it.
+# lakesh cannot turn it on; it can only report it. Check with:
+#     lakesh profiles show <name> --probe
+# To actually earn it, an ACCOUNTADMIN creates an agentic OAuth
+# integration and the profile authenticates through it:
+#     CREATE SECURITY INTEGRATION lakesh_agent
+#       TYPE = OAUTH
+#       OAUTH_CLIENT = CUSTOM
+#       OAUTH_CLIENT_TYPE = 'CONFIDENTIAL'
+#       OAUTH_REDIRECT_URI = 'http://localhost:8080/callback'
+#       IS_AGENTIC = TRUE
+#       ENABLED = TRUE;
+#
+# The keys, for any profile above (they belong inside that profile's own
+# table — do not open a second [profiles.<name>] block for them, TOML
+# refuses a redefined table):
+#
+#   session_context = false        # opt out entirely
+#   query_tag       = "acme-etl"   # override the default label
+#
+#   [profiles.<name>.session_variables]
+#   # Extra variables set alongside `client`, which lakesh owns and which
+#   # cannot be overridden. Names must be plain identifiers; each engine
+#   # applies its own namespace prefix (LAKESH_TEAM / lakesh.team).
+#   team = "data-eng"
+# --- Signed attestation: making the caller claim unforgeable --------------
+# The session stamp above is client-asserted. Signing makes it verifiable:
+# lakesh mints a short-lived token bound to the source session, and a UDF
+# inside a Snowflake masking policy checks it. No valid signature, no
+# unmasked data. Needs `pip install 'lakesh[sign]'`.
+#
+#   lakesh session keygen --kid agent-2026-08 -o ~/.config/lakesh/keys/agent.pem
+#   lakesh session install-sql -p <name> --label human   # review, run as ACCOUNTADMIN
+#
+# The token is written to QUERY_HISTORY verbatim and kept a year, so it is
+# bound to one CURRENT_SESSION() and expires in seconds — a token lifted
+# from history is useless. Cost is ~2s per query (the Python UDF runtime,
+# flat regardless of row count).
+#
+# The trust label comes from the KEY, not the token: generate a separate
+# key per caller. This only separates callers as far as the keys are
+# separated — an agent that can read the human key can sign as a human.
+#
+#   [profiles.<name>.signing]
+#   method       = "hmac"                  # hmac (default) | ecdsa
+#   kid          = "agent-2026-08"
+#   key_file     = "~/.config/lakesh/keys/agent.key"
+#   # key_env      = "LAKESH_SIGNING_KEY"    # alternative
+#   # key_keychain = "lakesh-agent"          # macOS Keychain / libsecret
+#
+# `hmac` verifies in pure SQL and costs ~0.2s per query over the
+# no-policy floor. `ecdsa` needs a Python UDF and costs ~2.5s, and is
+# for environments that require the source to hold nothing forgeable --
+# an HMAC secret can mint proofs, a public key cannot. The generator
+# keeps the HMAC secret in an RBAC-protected table, never in DDL:
+# verified, a role with only SELECT on the protected table is denied on
+# the keys table and on GET_DDL of the policy, and a valid proof still
+# unmasks.
+
+# --- Python backend: a PEP 249 driver instead of ADBC ---------------------
+# type = "python" serves a profile from a Python driver (python-duckdb,
+# snowflake-connector-python, psycopg) or your own "module:callable". No
+# ADBC .so; on Snowflake it can reach agent-activation the ADBC driver
+# cannot. Extras: pip install 'lakesh[snowflake-python]' /
+# 'lakesh[postgres-python]'. `dialect` is required (no .so to guess from).
+# [profiles.snow_py]
+# type    = "python"
+# backend = "snowflake"          # duckdb | snowflake | postgres | pyiceberg | module:callable
+# dialect = "snowflake"
+#
+# [profiles.snow_py.options]     # passed to the driver's connect()
+# account   = "myorg-account1"
+# warehouse = "MY_WH"
+# # application override: default activates agent-masking (cortex_code_cli)
+# # over MCP; set an honest value to opt out -- see the README.
+# # application = "lakesh/mcp"
 """

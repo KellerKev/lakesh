@@ -12,6 +12,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape as _esc
 
 from . import __version__
 from .config import (
@@ -22,6 +23,7 @@ from .config import (
     write_example_config,
 )
 from . import duck as _duck
+from . import backend as _backend
 from .duck import adbc_native_scan, catalog_alias, connect, connect_native
 from .oauth import AuthRequired
 from .output import render_csv, render_json, render_table
@@ -41,10 +43,12 @@ config_app = typer.Typer(help="Manage the TOML config file.")
 profiles_app = typer.Typer(help="List + inspect configured profiles.")
 auth_app = typer.Typer(help="OAuth2 login + token cache management.")
 stage_app = typer.Typer(help="Stage local files where the source can read them.")
+session_app = typer.Typer(help="Signing keys + the SQL that verifies them.")
 app.add_typer(config_app, name="config")
 app.add_typer(profiles_app, name="profiles")
 app.add_typer(auth_app, name="auth")
 app.add_typer(stage_app, name="stage")
+app.add_typer(session_app, name="session")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -236,32 +240,34 @@ def exec(
     # DSN inline, so everything printed from here on gets scrubbed.
     secrets = profile_secrets(prof)
 
-    handle: Optional[int] = None
     try:
-        if native:
-            con, handle = connect_native(prof, interactive=sys.stderr.isatty())
-        else:
-            con = connect(prof, interactive=sys.stderr.isatty())
+        # `native` forces the ADBC passthrough; without it an adbc profile
+        # keeps using the attached path, as `exec` always has. The backend
+        # (adbc / python / duckdb) is otherwise chosen from the profile.
+        session = _backend.open_session(
+            prof, interactive=sys.stderr.isatty(), native=native)
     except AuthRequired as e:
-        err_console.print(f"[red]{scrub(str(e), secrets)}[/red]")
+        err_console.print(f"[red]{_esc(scrub(str(e), secrets))}[/red]")
         raise typer.Exit(code=1)
     except Exception as e:
-        err_console.print(f"[red]connect failed:[/red] {scrub(str(e), secrets)}")
+        # escape(): an error message can carry square brackets (a pip
+        # extra like lakesh[snowflake-python]) that rich would otherwise
+        # eat as style markup.
+        err_console.print(f"[red]connect failed:[/red] {_esc(scrub(str(e), secrets))}")
         raise typer.Exit(code=1)
     policy = _mask.resolve(cfg, prof, requested=mask)
     try:
-        cur = adbc_native_scan(con, handle, query) if native else con.execute(query)
-        columns = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchall()
+        # run() routes reads vs writes so a write cannot be applied twice.
+        columns, rows = session.run(query)
         rows, mask_report = _mask.mask_rows(policy, columns, rows)
     except Exception as e:
-        err_console.print(f"[red]{scrub(str(e), secrets)}[/red]")
+        err_console.print(f"[red]{_esc(scrub(str(e), secrets))}[/red]")
         hint = _duck.explain_sandbox_error(e)
         if hint:
             err_console.print(f"[yellow]hint:[/yellow] {hint}")
         raise typer.Exit(code=1)
     finally:
-        con.close()
+        session.close()
 
     if not columns:
         console.print("[dim]ok[/dim]")
@@ -637,9 +643,19 @@ def profiles_list(
 @profiles_app.command("show")
 def profiles_show(
     name: str = typer.Argument(...),
+    probe: bool = typer.Option(
+        False, "--probe",
+        help="Also connect and ask the source who it thinks you are."),
     config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
 ):
-    """Dump one profile with secrets redacted."""
+    """Dump one profile with secrets redacted.
+
+    `--probe` additionally opens a connection and reports what the source
+    says about the session — on Snowflake that includes whether it is
+    agent-activated, which decides whether agent-specific masking
+    policies apply. It is opt-in because everything else here is read
+    from the config file and costs nothing.
+    """
     cfg = _load_or_die(config_path)
     try:
         p = cfg.get(name)
@@ -665,6 +681,77 @@ def profiles_show(
     console.print(
         f"  oauth      = {p.oauth.grant if p.oauth.enabled else 'disabled'}"
     )
+    console.print(f"  session_context = {p.session_context}")
+    if probe:
+        _print_session_probe(p)
+
+
+def _print_session_probe(p) -> None:
+    """Report what the source says about a session we open to it."""
+    from . import dialect as _dialect
+    from . import duck as _duck
+
+    console.print("\n[bold]source session[/bold]")
+    if p.type != "adbc":
+        console.print(f"  (a {p.type} profile has no server-side session)")
+        return
+    try:
+        con, handle = _duck.connect_native(p, interactive=sys.stderr.isatty())
+    except Exception as e:
+        # A failed connect quotes the statement with the DSN inline.
+        err_console.print(f"[red]{scrub(str(e), profile_secrets(p))}[/red]")
+        raise typer.Exit(code=1)
+    try:
+        reported = _duck.session_probe(con, handle, p)
+    finally:
+        con.close()
+
+    if reported is None:
+        console.print(
+            f"  ({_dialect.for_profile(p).name} cannot report on its own "
+            f"session over this path)")
+        return
+    for key, value in reported.items():
+        console.print(f"  {key:16} = {value}")
+    if "agent_activated" in reported:
+        # The whole point of the probe. Say plainly what a FALSE means,
+        # because the failure this guards against is an operator assuming
+        # a masking policy is protecting them when it never fires.
+        if str(reported["agent_activated"]).upper() == "TRUE":
+            console.print(
+                "\n  [green]This session is agent-activated[/green] — policies "
+                "keyed on IS_AGENT_ACTIVATED will apply.")
+        else:
+            console.print(
+                "\n  [yellow]NOT agent-activated[/yellow]: policies keyed on "
+                "IS_AGENT_ACTIVATED will not fire. lakesh cannot set this — a "
+                "session earns it from how it authenticated. See the agentic "
+                "OAuth section in the README.")
+    stamp = _duck.LAST_STAMP or {}
+    attested = stamp.get("attested")
+    if attested:
+        console.print(
+            f"\n  [green]attested[/green] via {attested['method']} as "
+            f"kid={attested['kid']} (caller {attested['caller']}), bound to "
+            f"session {attested['bound_to_session']}")
+        if attested["method"] == "hmac":
+            # The two methods differ in what the source can do with the
+            # material it holds, which is the whole reason to pick one.
+            console.print(
+                "  [yellow]Symmetric[/yellow]: whoever can read the source's "
+                "keys table can forge a proof. Verifies in pure SQL (~0.2s).")
+        else:
+            console.print(
+                "  [green]Asymmetric[/green]: the source holds only a public "
+                "key and cannot forge. Costs ~2.6s per query.")
+        console.print(
+            "  A policy calling ATTESTED_CALLER() will see this key's trust "
+            "label. Confirm with your own query against that function.")
+    elif "lakesh_client" in reported:
+        console.print(
+            "  The lakesh_client value is [yellow]client-asserted[/yellow]: "
+            "useful for attribution, not a control. Configure `[signing]` to "
+            "make it verifiable.")
 
 
 if __name__ == "__main__":
@@ -811,3 +898,84 @@ def stage_load(
         + (f" ({loaded} rows)" if loaded is not None else "")
         + f"  [dim]now {result['rows_after']} rows[/dim]"
     )
+
+
+# --------------------------------------------------------------------------
+# session — signing keys, and the SQL that verifies them
+#
+# lakesh generates the Snowflake-side DDL and never runs it. Installing a
+# masking policy is an account-wide governance change that wants a human
+# reading it first, and the tool asking to be trusted is the wrong thing
+# to be silently creating the object that decides whether to trust it.
+
+
+@session_app.command("keygen")
+def session_keygen(
+    kid: str = typer.Option(..., "--kid", help="Key id, e.g. agent-2026-08."),
+    out: Path = typer.Option(..., "-o", "--out", help="Where to write the key."),
+    method: str = typer.Option(
+        "hmac", "--method",
+        help="hmac (default, verifies in pure SQL, ~0.29s/query) or ecdsa "
+             "(public-key, needs a Python UDF, ~2.75s/query)."),
+):
+    """Generate an ES256 signing keypair for one caller.
+
+    Generate a *separate* key per caller and keep them apart. An agent
+    that can read the human key can sign as a human — that separation is
+    the whole property, and it lives in your filesystem, not in lakesh.
+    """
+    from . import attest
+
+    if method not in attest.METHODS:
+        err_console.print(
+            f"[red]unknown --method {method!r} "
+            f"(supported: {', '.join(attest.METHODS)})[/red]")
+        raise typer.Exit(code=2)
+    try:
+        if method == "hmac":
+            material, public = attest.generate_secret(), None
+        else:
+            material, public = attest.generate_keypair()
+        path = attest.write_private_key(out, material)
+    except attest.SigningError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    console.print(f"[green]wrote[/green] {path} [dim](mode 600)[/dim]")
+    console.print("\n[bold]Add to the profile:[/bold]")
+    # markup=False: a TOML table header is square-bracketed and rich
+    # would parse it as a style tag and print nothing.
+    console.print(f'  [profiles.<name>.signing]\n  method   = "{method}"'
+                  f'\n  kid      = "{kid}"\n  key_file = "{path}"', markup=False)
+    if public:
+        console.print("\n[bold]Public key[/bold] (goes into the Snowflake verifier):")
+        console.print(public.strip())
+    else:
+        console.print(
+            "\n[yellow]This is a shared secret.[/yellow] The same value goes "
+            "into the source's key table, where it must be readable by nobody "
+            "\u2014 anyone who can read it can forge a proof.")
+    console.print(
+        "\n[dim]Then: lakesh session install-sql -p <name> --label human[/dim]")
+
+
+@session_app.command("install-sql")
+def session_install_sql(
+    profile: Optional[str] = typer.Option(None, "-p", "--profile"),
+    label: str = typer.Option(
+        "human", "--label",
+        help="Trust label this key grants, as the masking policy will test it."),
+    schema: str = typer.Option("LAKESH_GOV", "--schema"),
+    config_path: Optional[Path] = typer.Option(None, "-c", "--config"),
+):
+    """Print the Snowflake DDL that verifies this profile's signature.
+
+    Review it and run it as ACCOUNTADMIN. lakesh does not execute it.
+    """
+    from . import attest
+
+    p = _stage_profile(profile, config_path)
+    try:
+        print(attest.install_sql(p, schema, label))
+    except attest.SigningError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)

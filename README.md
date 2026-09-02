@@ -5,11 +5,12 @@
 </p>
 
 `lakesh` is a DuckDB-powered SQL shell for **Iceberg REST catalogs,
-DuckLake metastores, and any database with an ADBC driver**.
-Profile-based connection management, an interactive REPL with SQL
-autocomplete + history + `psql`-style meta-commands, a one-shot `exec`
-mode for scripts, and an MCP server so LLM agents can query your
-catalogs through the same plumbing.
+DuckLake metastores, any database with an ADBC driver, and any Python
+data driver** (PEP 249 or pyiceberg). Profile-based connection
+management, an interactive REPL with SQL autocomplete + history +
+`psql`-style meta-commands, a one-shot `exec` mode for scripts, and an
+MCP server so LLM agents can query your catalogs through the same
+plumbing.
 
 It's a thin layer on top of DuckDB's `iceberg`, `ducklake`, and
 `adbc_scanner` extensions — DuckDB does the heavy lifting (Parquet
@@ -17,10 +18,13 @@ reads, predicate pushdown, joins); `lakesh` handles the ergonomics that
 the stock `duckdb` CLI doesn't:
 
 - Multiple catalog profiles in a TOML config, switchable via `-p <name>`.
-- Three profile types: **Iceberg REST** (PyIceberg-style endpoint),
-  **DuckLake direct** (Postgres metadata + S3 data path), or **ADBC**
+- Four profile types: **Iceberg REST** (PyIceberg-style endpoint),
+  **DuckLake direct** (Postgres metadata + S3 data path), **ADBC**
   (Postgres, MySQL, Snowflake, BigQuery, SQL Server, Trino, Flight SQL,
-  SQLite, … via [ADBC drivers](https://arrow.apache.org/adbc/)).
+  SQLite, … via [ADBC drivers](https://arrow.apache.org/adbc/)), or
+  **Python** (a PEP 249 driver — `python-duckdb`,
+  `snowflake-connector-python`, psycopg, or your own — no ADBC `.so`
+  needed; see [Python backends](#python-backends--type--python)).
 - Native OAuth2 per data source: **client-credentials, device-code, and
   authorization-code (PKCE)** grants, with token caching + refresh
   (`lakesh auth login/status/logout`).
@@ -28,9 +32,16 @@ the stock `duckdb` CLI doesn't:
   path-style + delegation-mode footguns.
 - psql-style `\\l` / `\\d` / `\\timing` / `\\format` meta-commands.
 - Result formatting as rich tables, JSON (for pipes), or CSV.
-- **MCP server** (`lakesh mcp`) exposing `query` / `list_namespaces` /
-  `list_tables` / `describe_table` / `list_profiles` to Claude Desktop,
-  Cline, Continue, etc. Read-only by default for LLM-safety.
+- **MCP server** (`lakesh mcp`) exposing `query`, `search_objects`,
+  `list_namespaces` / `list_tables` / `describe_table`, `stage_*`, and
+  `session_status` to Claude Desktop, Cline, Continue, etc. Read-only by
+  default, with optional render-time PII masking.
+- **Tells the source who is asking** — every session is labelled
+  (`QUERY_TAG` / `application_name` / HTTP User-Agent), and that claim can
+  be made *unforgeable* with a signed attestation a masking policy
+  verifies. On Snowflake the python backend can even earn
+  `IS_AGENT_ACTIVATED`. See [Telling the source who is
+  asking](#telling-the-source-who-is-asking).
 
 Built as the companion CLI for
 [`duckicelake`](https://github.com/KellerKev/duckicelake) — a governed
@@ -304,6 +315,133 @@ option value as a bound parameter.
 The MCP `query` tool defaults to native for adbc profiles and reports
 which mode ran; pass `native=false` to force DuckDB.
 
+### Python backends — `type = "python"`
+
+ADBC is the default, but a profile can be served by a **Python driver**
+instead: `python-duckdb`, `pyiceberg`, psycopg, `snowflake-connector-python`,
+or your own. Reach for it when your catalog speaks no SQL (`pyiceberg`,
+covered below), when there's no ADBC `.so` to install, or when the native
+Python driver exposes something ADBC's does not.
+
+The interface is just **PEP 249 (Python DB-API 2.0)** — the standard
+`python-duckdb`, `psycopg` and `snowflake-connector-python` already
+implement — so shipped backends are thin adapters with no per-driver
+code, and your own driver joins with none either.
+
+```toml
+[profiles.pg]
+type    = "python"
+backend = "postgres"           # duckdb | postgres | snowflake | pyiceberg | "module:callable"
+dialect = "postgres"           # required: no .so to guess capabilities from
+
+[profiles.pg.options]          # passed straight to the driver's connect()
+host   = "db.internal"
+dbname = "analytics"
+user   = "reporting"
+```
+
+Shipped backends (`snowflake` and `postgres` are optional extras;
+`duckdb` needs nothing):
+
+```bash
+pip install 'lakesh[snowflake-python]'   # snowflake-connector-python
+pip install 'lakesh[postgres-python]'    # psycopg
+pip install 'lakesh[iceberg-python]'     # pyiceberg (see below)
+```
+
+A python profile gets the **whole feature set** through the same code
+paths as ADBC — `query`, paging, `list_tables`/`describe_table` with
+freshness, `search_objects`, masking, the read-only gate, timeouts.
+Writes run exactly once (no `adbc_scan` double-execution).
+
+**Two families of source.** Most drivers speak SQL (DB-API), and lakesh
+sends SQL straight to them. A few — `pyiceberg`, a custom REST catalog —
+speak no SQL: the `pyiceberg` backend reads **metadata from the catalog
+API** and **scans data to Arrow**, which lakesh then queries in an
+in-process DuckDB. That reaches Iceberg catalogs DuckDB's own extension
+can't (Glue, Hive, SQL catalogs), and gives them the same
+`list_tables`/`describe_table`/`search_objects`/`query` surface:
+
+```toml
+[profiles.lake]
+type      = "python"
+backend   = "pyiceberg"
+dialect   = "duckdb"          # SQL runs in DuckDB over the scanned Arrow
+uri       = "http://catalog:8181"
+warehouse = "lake"
+
+[profiles.lake.s3]            # reused for the pyiceberg scan
+endpoint   = "http://minio:9000"
+access_key = "..."
+secret_key = "..."
+path_style = true
+```
+
+*Verified end to end against [duckicelake](https://github.com/KellerKev/duckicelake):
+the same catalog answers through an `iceberg-rest` profile, a `ducklake`
+profile, and this `pyiceberg` profile.*
+
+**A custom backend** is a `"module:callable"` in `backend` — no packaging
+needed. The callable takes `(profile, *, caller)` and returns either a
+DB-API connection (lakesh wraps it) or a full `Session` for a non-SQL
+source:
+
+```toml
+backend = "mycompany.lakesh_ext:open"
+```
+
+```python
+# mycompany/lakesh_ext.py
+def open(profile, *, caller=None):
+    import my_rest_driver           # any PEP 249 driver
+    return my_rest_driver.connect(**profile.options)
+```
+
+### Which Snowflake driver
+
+The Apache Arrow ADBC Snowflake driver is **frozen at 1.11.0** (April
+2026) and was moved out of `apache/arrow-adbc` to the **ADBC Driver
+Foundry** (`adbc-drivers/snowflake`), installed with `dbc install
+snowflake` — same library name, a drop-in for the `driver` path in an
+`adbc` profile. Or sidestep it entirely with a `type = "python"` +
+`backend = "snowflake"` profile, which uses `snowflake-connector-python`
+and needs no `.so`.
+
+### Agent activation
+
+Snowflake can apply agent-specific masking policies when a session is
+*agent-activated* (`SYS_CONTEXT('SNOWFLAKE$CURRENT','IS_AGENT_ACTIVATED')`).
+That is set from the login's `application` name, and the **ADBC driver
+mangles it** (it force-prepends `[ADBC][Go-…]`), so an ADBC session can
+never present the value Snowflake's allowlist accepts —
+`agent_activated` is always `FALSE`.
+
+The **python `snowflake` backend can**, because
+`snowflake-connector-python` sends `application` verbatim. Measured end
+to end:
+
+| driving lakesh | `application` sent | `agent_activated` |
+|---|---|---|
+| MCP (an agent) | `cortex_code_cli` (default) | **`TRUE`** |
+| CLI (a human) | `lakesh/<version> cli` | `FALSE` |
+
+So over MCP the backend **defaults to activating** agent-masking — the
+governance-positive outcome when an agent is driving — while a human at
+the CLI stays honestly labelled and is not treated as an agent.
+
+> **The tradeoff, stated plainly.** `cortex_code_cli` is Cortex Code's
+> identity, so activating this way records the session as Cortex Code
+> (`AGENT_TYPE = CORTEX_LITE_AGENT`) in your account's audit trail. It
+> rides an **undocumented allowlist** Snowflake can change at any time.
+> To label honestly instead, set `application` yourself:
+>
+> ```toml
+> [profiles.warehouse.options]
+> application = "lakesh/mcp"    # honest; does not activate
+> ```
+>
+> Check what a session actually is with `lakesh profiles show <p> --probe`.
+
 ### Snowflake profile
 
 ```toml
@@ -361,12 +499,12 @@ For iceberg-rest profiles the token endpoint defaults to the catalog's
 own `/v1/oauth/tokens` — existing configs keep working unchanged.
 
 ```toml
-[profiles.snow.oauth]
+[profiles.prod.oauth]
 grant                         = "device_code"
 client_id                     = "lakesh-cli"
 device_authorization_endpoint = "https://idp.example.com/oauth2/v1/device/authorize"
 token_endpoint                = "https://idp.example.com/oauth2/v1/token"
-scope                         = "session:role:ANALYST offline_access"
+scope                         = "catalog:read offline_access"
 ```
 
 Tokens (access + refresh + expiry) are cached in
@@ -375,9 +513,9 @@ as config-file secrets) and refreshed automatically. Interactive grants
 only prompt when nothing cached is usable:
 
 ```bash
-lakesh auth login -p snow      # run the flow, cache the token
+lakesh auth login -p prod      # run the flow, cache the token
 lakesh auth status             # per-profile cache state
-lakesh auth logout -p snow     # drop one profile's token (--all for everything)
+lakesh auth logout -p prod     # drop one profile's token (--all for everything)
 ```
 
 Where the token lands: for iceberg-rest it goes into the `ICEBERG`
@@ -457,6 +595,9 @@ Continue, …) to spawn it, and the LLM gets these tools:
 | `stage_upload(local_path, target, profile=None)` | Put a local file where the source can read it |
 | `stage_load(table, target, profile=None, file_format=None, create=False)` | COPY INTO an existing table from a stage |
 | `stage_list(target, profile=None)` / `stage_remove(...)` | Inspect and clear a staging target |
+| `session_status(profile="")` | What this session may do — and, with a profile, who the source thinks you are |
+| `set_read_only()` | Give up write access for the rest of the session; cannot be undone |
+| `set_masking()` | Mask recognisable PII in every result for the rest of the session |
 | `query(sql, profile=None, limit=1000, offset=0, format="json", native=None, timeout_s=None, estimate=False)` | Run SQL and return results |
 
 ### Finding things — `search_objects`
@@ -541,7 +682,7 @@ Override per call with `timeout_s` (`0` disables), for the whole server
 with `LAKESH_MCP_TIMEOUT_S`, or per profile:
 
 ```toml
-[profiles.snowflake]
+[profiles.lake]
 query_timeout_s = 60
 ```
 
@@ -639,17 +780,17 @@ know. Mark up your tables and `list_tables`, `describe_table` and
 `search_objects` will carry the warning:
 
 ```toml
-[profiles.snow]
+[profiles.lake]
 status        = "canonical"   # profile-wide default
 max_staleness = "24h"
 
-[profiles.snow.tables]
-"ANALYTICS.FCT_REVENUE"    = { status = "canonical", max_staleness = "6h", note = "billing source of truth" }
-"ANALYTICS.FCT_REVENUE_V1" = { status = "deprecated", superseded_by = "ANALYTICS.FCT_REVENUE" }
-"STAGING.*"                = { status = "deprecated", note = "raw landing zone; do not query" }
+[profiles.lake.tables]
+"analytics.fct_revenue"    = { status = "canonical", max_staleness = "6h", note = "billing source of truth" }
+"analytics.fct_revenue_v1" = { status = "deprecated", superseded_by = "analytics.fct_revenue" }
+"staging.*"                = { status = "deprecated", note = "raw landing zone; do not query" }
 ```
 
-Keys **must be quoted** — an unquoted `ANALYTICS.FCT_REVENUE` is TOML
+Keys **must be quoted** — an unquoted `analytics.fct_revenue` is TOML
 dotted-key syntax and nests silently instead of becoming a literal key.
 Globs are allowed, and the **most specific** match wins regardless of
 file order: an exact key beats a glob, a longer glob beats a shorter one.
@@ -865,12 +1006,242 @@ and friends); its write procedures are not. For anything else, vouch for
 it yourself:
 
 ```toml
-[profiles.snow]
-read_procedures = ["my_reporting_proc", "SYSTEM$CLUSTERING_INFORMATION"]
+[profiles.lake]
+read_procedures = ["my_reporting_proc", "monthly_rollup"]
 ```
 
 That is a **declaration, not a verification** — lakesh cannot check what
 a procedure does, and this list is you saying you have.
+
+### Telling the source who is asking
+
+An agent driving lakesh over MCP used to look like any other ADBC client.
+Now every session lakesh opens is labelled with whether a human or an
+agent is behind it, so the engine's audit trail can tell them apart:
+
+| profile | audit label | readable variable | what the source sees |
+|---|---|---|---|
+| Snowflake (ADBC) | `QUERY_TAG` | `LAKESH_CLIENT` | both, plus `QUERY_HISTORY` |
+| Postgres (ADBC) | `application_name` | `lakesh.client` | both, in `pg_stat_activity` |
+| DuckLake | — | `lakesh_client` (DuckDB) | its **Postgres metastore**, via `application_name` in the DSN |
+| Iceberg REST / duckicelake | — | `lakesh_client` (DuckDB) | the HTTP **User-Agent** |
+| anything else (ANSI) | — | — | nothing — reported as unavailable |
+
+Set at connect time, because none of them survive a new connection and
+lakesh opens one per call. On by default, one statement:
+
+```toml
+[profiles.lake]
+session_context = false          # opt out
+query_tag       = "acme-etl"     # or override the label
+
+[profiles.lake.session_variables]
+team = "data-eng"                # extra variables alongside `client`
+```
+
+**This is attribution, not access control.** The value is
+client-asserted: the same credentials that set `LAKESH_CLIENT = 'mcp'`
+can set it to anything, or leave it unset. A masking policy *can* read it
+— `GETVARIABLE` is callable from a policy body, verified by creating one
+— but such a policy is trusting the client to be honest about itself.
+
+Two path caveats, both measured. On **DuckDB-hosted engines** the
+variable is local to the process, so nothing server-side reads it; the
+signals that actually cross the wire there are the metastore's
+`application_name` and the HTTP User-Agent. And an **ADBC profile
+reached through the attached-catalog path** (without `--native`) has no
+handle to send the statement down, so it reports `stamped: false` with a
+reason rather than pretending.
+
+#### Snowflake agent activation, over ADBC vs. the Python backend
+
+Snowflake can apply policies keyed on
+`SYS_CONTEXT('SNOWFLAKE$CURRENT', 'IS_AGENT_ACTIVATED')`, derived from the
+login's `application` name. There are three ways this plays out, and
+`--probe` always tells you which you got:
+
+- **Over the ADBC path it cannot be reached.** It is not a settable
+  session variable (`ALTER SESSION SET IS_AGENT_ACTIVATED` and
+  `SYSTEM$SET_SESSION_CONTEXT` both error), and the ADBC driver
+  force-prefixes the application name with `[ADBC][Go-…]`, so Snowflake's
+  allowlist never sees the bare value.
+- **The Python `snowflake` backend reaches it**, because it sends
+  `application` verbatim — see [Agent activation](#agent-activation).
+- **Or authenticate through an agentic OAuth integration** (below), which
+  earns it from the authentication itself.
+
+Either way, lakesh **reports the truth** so you never assume a policy
+applies when it does not:
+
+```bash
+lakesh profiles show snow --probe
+```
+```
+source session
+  agent_activated  = FALSE
+  user_name        = ANALYST_SVC
+  role_name        = ANALYST
+  client           = Go 1.19.0
+  lakesh_client    = cli
+
+  NOT agent-activated: policies keyed on IS_AGENT_ACTIVATED will not fire.
+```
+
+Over MCP the same check is `session_status` with a `profile` argument.
+
+**The OAuth route**, if you'd rather earn activation from authentication
+than assert it via the Python backend's `application`. An `ACCOUNTADMIN`
+creates the integration once:
+
+```sql
+CREATE SECURITY INTEGRATION lakesh_agent
+  TYPE = OAUTH
+  OAUTH_CLIENT = CUSTOM
+  OAUTH_CLIENT_TYPE = 'CONFIDENTIAL'
+  OAUTH_REDIRECT_URI = 'http://localhost:8080/callback'
+  IS_AGENTIC = TRUE
+  ENABLED = TRUE;
+```
+
+then point a profile at it using the OAuth support lakesh already has:
+
+```toml
+[profiles.snow]
+type         = "adbc"
+driver       = "snowflake"
+token_option = "adbc.snowflake.sql.client_option.auth_token"
+
+[profiles.snow.options]
+"adbc.snowflake.sql.account"   = "myorg-account1"
+"adbc.snowflake.sql.auth_type" = "auth_oauth"   # required — see below
+
+[profiles.snow.oauth]
+grant                 = "authorization_code"
+client_id             = "..."
+authorization_endpoint = "https://myorg-account1.snowflakecomputing.com/oauth/authorize"
+token_endpoint         = "https://myorg-account1.snowflakecomputing.com/oauth/token-request"
+```
+
+Re-run `--probe` afterwards; `agent_activated` is how you know it worked.
+
+#### Signed attestation — making the claim unforgeable
+
+The stamp above is client-asserted. If you want a policy to *act* on it,
+lakesh can sign it instead: a short-lived token that a UDF inside a
+masking policy verifies. No valid signature, no unmasked data.
+
+```bash
+lakesh session keygen --kid agent-2026-08 -o ~/.config/lakesh/keys/agent.key
+```
+```toml
+[profiles.snow.signing]
+method   = "hmac"                                # hmac (default) | ecdsa
+kid      = "agent-2026-08"
+key_file = "~/.config/lakesh/keys/agent.key"     # or key_env / key_keychain
+```
+```bash
+lakesh session install-sql -p snow --label human > verifier.sql   # review, then run as ACCOUNTADMIN
+```
+
+That installs the verifier and a masking policy. Then the same credential
+gives different answers:
+
+```console
+$ lakesh exec -p snow -q 'SELECT email FROM customers LIMIT 1'   # key configured
+ada@example.com
+$ lakesh exec -p snow -q 'SELECT email FROM customers LIMIT 1'   # key removed
+***masked***
+```
+
+Verified against a live account, the policy fails closed on every one of:
+no proof, wrong secret, garbage, a truncated proof, and **a valid proof
+replayed into a different session**.
+
+That last one is not optional. `SET x = '<proof>'` is written verbatim to
+`ACCOUNT_USAGE.QUERY_HISTORY`, kept for a year and readable by
+`GOVERNANCE_VIEWER` — and bind variables don't help, they just move the
+value to the `BIND_VALUES` column. So every proof is bound to one
+`CURRENT_SESSION()`. A proof lifted out of query history is useless
+anywhere else.
+
+#### Which method
+
+|  | client holds | in query history | cost, 1M rows | forgeable by |
+|---|---|---|---|---|
+| `hmac` (default) | shared secret | the proof | **0.41s** | anyone who can read the keys table |
+| `ecdsa` | private key | the token | 2.75s | nobody |
+
+Baseline with no policy at all is 0.18s, so `hmac` costs ~0.2s per query
+and `ecdsa` ~2.6s. `hmac` is the default because that is a tax an agentic
+tool pays on every call.
+
+The `hmac` secret never appears in DDL — the generator puts it in a table
+the policy owner alone can read. Verified: a role with only `SELECT` on
+the protected table is **denied** on the keys table, on `GET_DDL` of both
+the function and the policy, and on calling the verifier directly, *and*
+a valid proof still unmasks. That is Snowflake evaluating the policy body
+with the owner's rights. Choose `ecdsa` when the requirement is that the
+source hold nothing forgeable at all.
+
+**Two things neither method gives you.**
+
+*The trust label comes from the key, never from anything the client
+says.* Generate a **separate key per caller** — a deployment holding only
+the agent key cannot mint a human proof.
+
+*It only separates callers as far as the keys are separated.* The key
+lives on the client. An agent with shell access on a machine that also
+holds the human key can read it and sign as a human. Against a *different
+client* with the same credential — SnowSQL, DBeaver, a leaked PAT — this
+is strong, and that is the property worth building on: the tool becomes
+the gate, not just the credential. Against the agent itself it is only as
+good as your key isolation, which lakesh cannot enforce. Run the MCP
+server as an OS user owning only its own key, or use `key_keychain`.
+
+<details>
+<summary>Why the verifier looks the way it does (measured)</summary>
+
+Every figure is through a real masking policy over 1M rows, best of three:
+
+| policy body | best | mean |
+|---|---|---|
+| no policy | 0.18s | 0.24s |
+| HMAC, inlined, session-bound | **0.41s** | 0.90s |
+| HMAC via a helper SQL UDF | 1.00s | 1.36s |
+| `IS_AGENT_ACTIVATED` (platform signal) | 0.81s | 0.86s |
+| JavaScript UDF, `IMMUTABLE` | 1.09s | 1.29s |
+| Python UDF, `IMMUTABLE` | 2.13s | 2.23s |
+| Python ECDSA verify | 2.75s | 3.09s |
+| Java ECDSA verify | 2.85s | 3.18s |
+| Python UDF, `VOLATILE` | 4.01s | 4.20s |
+| Java UDF, `VOLATILE` | 5.09s | 5.33s |
+
+- **The cost is the runtime, not the crypto.** A Python UDF returning a
+  constant costs the same as one verifying ECDSA, and every figure is
+  flat from 1e3 to 1e6 rows — policy bodies are evaluated once per query.
+- **`IMMUTABLE` is worth ~2× on every UDF runtime.** It goes after
+  `LANGUAGE`; anywhere else is a bare "syntax error line 7".
+- **Java is the slowest**, matching the documented recompile-per-statement
+  for an inline handler without `TARGET_PATH` — despite having the best
+  crypto story (`KeyFactory`/`Signature` do work in the sandbox).
+- **JavaScript is the fastest UDF and unusable here**: no crypto, no
+  `require`, `eval()` disabled.
+- **A scalar SQL UDF called from a policy is not free** — factoring the
+  HMAC into a helper cost 0.6s, so it is inlined.
+- The proof carries **no timestamp**. One was tried and removed: it cost
+  another 0.6s, a replayed proof is already refused by the session
+  binding, and it made correctness depend on the client clock matching
+  Snowflake's — where skew masks everything and looks like a bad secret.
+
+</details>
+
+> **`auth_type` is required and lakesh enforces it.** Measured: with a
+> bearer token supplied but `auth_type` unset, the Snowflake driver
+> **silently discards the token** and authenticates with whatever else
+> the DSN carries. It connects, so there is no error to debug from — the
+> session just isn't the one you configured, and agent policies quietly
+> never fire. A profile with `oauth` and no `auth_type` is now refused at
+> config load.
 
 ### Read-only sessions
 
@@ -1140,18 +1511,22 @@ lakesh/
 ├── example.config.toml
 ├── src/lakesh/
 │   ├── config.py        # TOML loader + Profile dataclass + env indirection
-│   ├── duck.py          # DuckDB connect: iceberg-rest / ducklake / adbc
+│   ├── backend.py       # Session abstraction: adbc / duckdb-attached / python (PEP 249, pyiceberg)
+│   ├── duck.py          # DuckDB connect + native passthrough, sandbox, deadlines, session stamp
+│   ├── dialect.py       # per-engine capabilities (explain/timeout/paging/session context) as data
+│   ├── attest.py        # signed session attestation (hmac / ecdsa) + Snowflake verifier SQL
+│   ├── guard.py         # read-only write gate + session restriction ratchet
+│   ├── mask.py          # render-time PII masking (default + custom RE2 rules)
+│   ├── redact.py        # scrub secrets out of error text / logs
+│   ├── freshness.py     # declared + observed table freshness / canonicality
+│   ├── staging.py       # stage local files (Snowflake PUT/COPY), path allow-list
 │   ├── oauth.py         # OAuth2 grants (cc / device / auth-code+PKCE) + token cache
 │   ├── output.py        # rich table / json / csv formatters
 │   ├── repl.py          # prompt_toolkit REPL + meta-commands
-│   ├── mcp.py           # FastMCP server: query / list_* / describe_table tools
-│   └── cli.py           # typer-based entry points (incl. `lakesh auth …`)
-└── tests/
-    ├── test_config.py        # config parsing (iceberg-rest + ducklake + adbc + oauth)
-    ├── test_oauth.py         # all three grants + refresh + token cache (mocked HTTP)
-    ├── test_adbc.py          # adbc SQL builders + live sqlite e2e (auto-skips)
-    ├── test_mcp.py           # MCP tools + read-only safety gate + AuthRequired
-    └── test_integration.py   # live query against a running catalog (auto-skips)
+│   ├── mcp.py           # FastMCP server: query / search / list_* / describe / stage_* / session_status
+│   └── cli.py           # typer entry points (exec, run, auth, stage, session, profiles)
+└── tests/               # config, backend, adbc, dialect, guard, mask, redact, freshness,
+    └── ...              # staging, attest, oauth, mcp, sandbox, integration (live tests auto-skip)
 ```
 
 ## Testing

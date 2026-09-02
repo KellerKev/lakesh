@@ -163,6 +163,10 @@ path_style = true
 #
 # [profiles.snow.options]
 # "adbc.snowflake.sql.account" = "myorg-account1"
+# # REQUIRED with oauth, and validated at load. Without it the driver
+# # silently ignores the bearer token and authenticates as whatever else
+# # the DSN carries — it connects, so there is no error to notice.
+# "adbc.snowflake.sql.auth_type" = "auth_oauth"
 #
 # [profiles.snow.oauth]
 # grant                         = "device_code"
@@ -170,3 +174,92 @@ path_style = true
 # device_authorization_endpoint = "https://idp.example.com/oauth2/v1/device/authorize"
 # token_endpoint                = "https://idp.example.com/oauth2/v1/token"
 # scope                         = "session:role:ANALYST offline_access"
+
+# --- Session context: telling the source who is asking --------------------
+# On by default. lakesh labels every session it opens with whether a
+# human (cli) or an agent (mcp) is driving, so the engine's audit trail
+# can tell them apart. On Snowflake that is QUERY_TAG plus a
+# LAKESH_CLIENT session variable; on Postgres, application_name plus
+# lakesh.client.
+#
+# This is ATTRIBUTION, NOT ACCESS CONTROL. The value is client-asserted:
+# the same credentials that set LAKESH_CLIENT = 'mcp' can set it to
+# anything. A masking policy may read it (GETVARIABLE works in a policy
+# body), but it is trusting the client to be honest.
+#
+# Session context reaches more than Snowflake. Postgres gets
+# application_name + lakesh.client (visible in pg_stat_activity); a
+# DuckLake metastore is labelled through its DSN; an Iceberg REST
+# catalog such as duckicelake sees lakesh in the HTTP User-Agent. On
+# DuckDB-hosted engines the variable is process-local -- nothing
+# server-side reads it. ADBC profiles used WITHOUT --native have no
+# handle to send the statement down and report that honestly.
+#
+# Snowflake's IS_AGENT_ACTIVATED is the trustworthy version, because it
+# is derived from how the session authenticated and no client can set it.
+# lakesh cannot turn it on; it can only report it:
+#     lakesh profiles show <name> --probe
+#
+# These keys go inside a profile's own table — do not open a second
+# [profiles.<name>] block for them, TOML refuses a redefined table:
+#
+#   session_context = false        # opt out entirely
+#   query_tag       = "acme-etl"   # override the default label
+#
+#   [profiles.<name>.session_variables]
+#   # Extra variables set alongside `client`, which lakesh owns and which
+#   # cannot be overridden. Names must be plain identifiers; each engine
+#   # applies its own namespace prefix (LAKESH_TEAM / lakesh.team).
+#   team = "data-eng"
+# --- Signed attestation: making the caller claim unforgeable --------------
+# The session stamp above is client-asserted. Signing makes it verifiable:
+# lakesh mints a short-lived token bound to the source session, and a UDF
+# inside a Snowflake masking policy checks it. No valid signature, no
+# unmasked data. Needs `pip install 'lakesh[sign]'`.
+#
+#   lakesh session keygen --kid agent-2026-08 -o ~/.config/lakesh/keys/agent.pem
+#   lakesh session install-sql -p <name> --label human   # review, run as ACCOUNTADMIN
+#
+# The token is written to QUERY_HISTORY verbatim and kept a year, so it is
+# bound to one CURRENT_SESSION() and expires in seconds — a token lifted
+# from history is useless. Cost is ~2s per query (the Python UDF runtime,
+# flat regardless of row count).
+#
+# The trust label comes from the KEY, not the token: generate a separate
+# key per caller. This only separates callers as far as the keys are
+# separated — an agent that can read the human key can sign as a human.
+#
+#   [profiles.<name>.signing]
+#   method       = "hmac"                  # hmac (default) | ecdsa
+#   kid          = "agent-2026-08"
+#   key_file     = "~/.config/lakesh/keys/agent.key"
+#   # key_env      = "LAKESH_SIGNING_KEY"    # alternative
+#   # key_keychain = "lakesh-agent"          # macOS Keychain / libsecret
+#
+# `hmac` verifies in pure SQL and costs ~0.2s per query over the
+# no-policy floor. `ecdsa` needs a Python UDF and costs ~2.5s, and is
+# for environments that require the source to hold nothing forgeable --
+# an HMAC secret can mint proofs, a public key cannot. The generator
+# keeps the HMAC secret in an RBAC-protected table, never in DDL:
+# verified, a role with only SELECT on the protected table is denied on
+# the keys table and on GET_DDL of the policy, and a valid proof still
+# unmasks.
+
+# --- Python backend: a PEP 249 driver instead of ADBC ---------------------
+# type = "python" serves a profile from a Python driver (python-duckdb,
+# snowflake-connector-python, psycopg) or your own "module:callable".
+# No ADBC .so; on Snowflake it can reach agent-activation the ADBC driver
+# cannot. Optional extras: pip install 'lakesh[snowflake-python]' /
+# 'lakesh[postgres-python]'. `dialect` is required (no .so to guess from).
+# [profiles.snow_py]
+# type    = "python"
+# backend = "snowflake"          # duckdb | snowflake | postgres | pyiceberg | module:callable
+# dialect = "snowflake"
+#
+# [profiles.snow_py.options]     # passed to the driver's connect()
+# account   = "myorg-account1"
+# warehouse = "MY_WH"
+# # application override: default activates agent-masking (cortex_code_cli)
+# # over MCP; set an honest value to opt out. Writes a false Cortex
+# # identity into the audit trail when activating -- see the README.
+# # application = "lakesh/mcp"

@@ -1,6 +1,7 @@
 """Unit tests for config loading. Runs without any external services."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -915,3 +916,175 @@ mode = "mask"
 """))
     assert cfg.masking_mode == "audit"
     assert cfg.get("pg").masking_mode == "mask"
+
+
+# --------------------------------------------------------------------------
+# session context
+
+
+_SESSION_BASE = """
+default = "sf"
+
+[profiles.sf]
+type   = "adbc"
+driver = "snowflake"
+uri    = "u"
+"""
+
+
+def test_session_context_is_on_by_default(tmp_path):
+    """Unlike `upload_roots`, whose default is off: an allow-list governs
+    what lakesh may do, while this only labels a session lakesh was
+    opening anyway."""
+    p = load_config(_write(tmp_path, _SESSION_BASE)).get("sf")
+    assert p.session_context is True
+    assert p.query_tag == "" and p.session_variables == {}
+
+
+def test_session_context_can_be_turned_off(tmp_path):
+    cfg = load_config(_write(tmp_path, _SESSION_BASE + """
+session_context = false
+query_tag       = "acme-etl"
+
+[profiles.sf.session_variables]
+team = "data-eng"
+"""))
+    p = cfg.get("sf")
+    assert p.session_context is False
+    assert p.query_tag == "acme-etl"
+    assert p.session_variables == {"team": "data-eng"}
+
+
+def test_a_bad_session_variable_name_is_refused_at_load(tmp_path):
+    """These names are interpolated into SQL that operators write
+    policies against, so a bad one fails loudly at config load."""
+    with pytest.raises(ConfigError, match="plain identifier"):
+        load_config(_write(tmp_path, _SESSION_BASE + """
+[profiles.sf.session_variables]
+"drop table" = "x"
+""")).get("sf").validate()
+
+
+def test_client_cannot_be_overridden(tmp_path):
+    """An overridable caller label would be worthless to a policy."""
+    with pytest.raises(ConfigError, match="cannot be"):
+        load_config(_write(tmp_path, _SESSION_BASE + """
+[profiles.sf.session_variables]
+client = "definitely-a-human"
+""")).get("sf").validate()
+
+
+_SF_OAUTH = """
+default = "snow"
+
+[profiles.snow]
+type         = "adbc"
+driver       = "snowflake"
+token_option = "adbc.snowflake.sql.client_option.auth_token"
+
+[profiles.snow.oauth]
+grant          = "client_credentials"
+client_id      = "cid"
+client_secret  = "sec"
+token_endpoint = "https://idp.invalid/token"
+"""
+
+
+def test_snowflake_oauth_without_auth_type_is_refused(tmp_path):
+    """Measured: the driver silently discards the bearer token when
+    `auth_type` is unset and authenticates with whatever else the DSN
+    carries. It connects, so there is nothing to debug from."""
+    with pytest.raises(ConfigError, match="auth_oauth"):
+        load_config(_write(tmp_path, _SF_OAUTH)).get("snow").validate()
+
+
+def test_snowflake_oauth_with_auth_type_is_accepted(tmp_path):
+    cfg = load_config(_write(tmp_path, _SF_OAUTH + """
+[profiles.snow.options]
+"adbc.snowflake.sql.auth_type" = "auth_oauth"
+"""))
+    cfg.get("snow").validate()          # must not raise
+
+
+def test_the_auth_type_check_is_snowflake_only(tmp_path):
+    """Other drivers have their own conventions; this failure mode was
+    measured on Snowflake and is not assumed to generalise."""
+    cfg = load_config(_write(tmp_path, _SF_OAUTH.replace(
+        'driver       = "snowflake"', 'driver       = "postgresql"')))
+    cfg.get("snow").validate()          # must not raise
+
+
+# --------------------------------------------------------------------------
+# the shipped example config
+#
+# A commented-out block is still documentation people uncomment, so a
+# duplicate table header in one is a real defect — and exactly the one
+# that shipped here: two `[profiles.snowflake]` blocks, where uncommenting
+# both fails with "cannot redefine table".
+
+
+def _table_headers(text: str) -> list[str]:
+    """Every TOML table header, whether commented out or live."""
+    return re.findall(r"^\s*#?\s*(\[[A-Za-z0-9_.\"]+\])\s*$", text, re.M)
+
+
+@pytest.mark.parametrize("source", ["embedded", "file"])
+def test_example_config_declares_no_table_twice(source):
+    from lakesh.config import _EXAMPLE
+
+    text = _EXAMPLE if source == "embedded" else \
+        Path(__file__).resolve().parent.parent.joinpath("example.config.toml").read_text()
+    headers = _table_headers(text)
+    dupes = sorted({h for h in headers if headers.count(h) > 1})
+    assert not dupes, f"{source} example declares {dupes} more than once"
+
+
+def test_the_embedded_example_parses(tmp_path):
+    """Its live (uncommented) half must be a loadable config."""
+    from lakesh.config import _EXAMPLE
+
+    cfg = load_config(_write(tmp_path, _EXAMPLE))
+    for name in cfg.profiles:
+        cfg.get(name).validate()
+
+
+# --------------------------------------------------------------------------
+# python backend profiles
+
+
+def test_python_profile_requires_backend(tmp_path):
+    with pytest.raises(ConfigError, match="requires `backend`"):
+        load_config(_write(tmp_path, """
+default = "p"
+[profiles.p]
+type    = "python"
+dialect = "duckdb"
+""")).get("p").validate()
+
+
+def test_python_profile_requires_dialect(tmp_path):
+    """No driver path to guess capabilities from, so the dialect is
+    explicit."""
+    with pytest.raises(ConfigError, match="requires `dialect`"):
+        load_config(_write(tmp_path, """
+default = "p"
+[profiles.p]
+type    = "python"
+backend = "duckdb"
+""")).get("p").validate()
+
+
+def test_a_valid_python_profile_parses(tmp_path):
+    p = load_config(_write(tmp_path, """
+default = "p"
+[profiles.p]
+type    = "python"
+backend = "snowflake"
+dialect = "snowflake"
+
+[profiles.p.options]
+account = "myorg-account1"
+""")).get("p")
+    p.validate()
+    assert p.type == "python" and p.backend == "snowflake"
+    assert p.options["account"] == "myorg-account1"

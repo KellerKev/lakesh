@@ -85,13 +85,11 @@ from .config import (
 )
 from .duck import (
     QueryTimeout,
-    adbc_native_scan,
     catalog_alias,
-    connect,
-    connect_native,
     deadline,
 )
 from . import freshness
+from . import backend as _backend
 from .oauth import AuthRequired
 from . import dialect as _dialect
 from . import duck as _duck
@@ -146,6 +144,13 @@ _SYSTEM_SCHEMAS = ("main", "information_schema", "pg_catalog", "pg_toast")
 
 def _prefer_native(profile: Profile) -> bool:
     return profile.type == "adbc"
+
+
+def _metadata(sess):
+    """The session's catalog-API metadata provider, or None when metadata
+    comes from `information_schema` (the SQL path)."""
+    getter = getattr(sess, "metadata", None)
+    return getter() if getter else None
 
 
 def _lit(value: str) -> str:
@@ -233,16 +238,30 @@ def _ilike(column: str, like: str) -> str:
 
 
 @contextmanager
-def _open_native(
-    profile_name: str | None, timeout_s: float | None = None
-) -> Iterator[tuple[duckdb.DuckDBPyConnection, int, Profile]]:
-    cfg = _load_or_raise()
-    prof = cfg.get(profile_name)
-    con, handle = connect_native(prof, interactive=False, timeout_s=timeout_s)
+def _session(
+    profile_name: str | None, timeout_s: float | None = None,
+    native: bool | None = None,
+) -> "Iterator[_backend.Session]":
+    """One `Session` for a profile, whatever backend serves it.
+
+    Replaces the `_open_native`/`_open` split at the tool call sites: a
+    tool asks the session whether it `queries_source_directly` to choose
+    which SQL to build (source `information_schema` vs DuckDB catalog),
+    then runs it the same way regardless. A python-backed profile takes
+    the source-direct branch automatically, which is correct — it queries
+    the source's own `information_schema`.
+
+    `native` is passed through for adbc profiles (native passthrough vs
+    attached catalog); left None, metadata tools get the adbc default
+    (native), matching the old `_prefer_native` behaviour.
+    """
+    prof = _load_or_raise().get(profile_name)
+    sess = _backend.open_session(
+        prof, interactive=False, timeout_s=timeout_s, native=native)
     try:
-        yield con, handle, prof
+        yield sess
     finally:
-        con.close()
+        sess.close()
 
 
 # --------------------------------------------------------------------------
@@ -398,32 +417,6 @@ def _count_probe(sql: str) -> str:
     return f"SELECT count(*) AS n FROM ({sql}) AS _lakesh_est"
 
 
-def _native(con: duckdb.DuckDBPyConnection, handle: int, sql: str) -> tuple[list[str], list[tuple]]:
-    cur = adbc_native_scan(con, handle, sql)
-    columns = [d[0] for d in cur.description] if cur.description else []
-    return columns, cur.fetchall()
-
-
-@contextmanager
-def _open(profile_name: str | None, cfg: Config | None = None) -> Iterator[tuple[duckdb.DuckDBPyConnection, str]]:
-    """Resolve profile + ATTACH + yield (connection, catalog_alias).
-    Closes the connection on exit so we never leak DuckDB handles.
-
-    Connections are opened with `interactive=False`: an MCP server can't
-    run a browser or device-code login, so profiles on interactive
-    grants need a prior `lakesh auth login` in a terminal. Cached tokens
-    (incl. refresh) keep working here without any prompting; the
-    `AuthRequired` raised otherwise is surfaced to the caller as a JSON
-    error by each tool."""
-    cfg = cfg or _load_or_raise()
-    prof = cfg.get(profile_name)
-    con = connect(prof, interactive=False)
-    try:
-        yield con, catalog_alias(prof)
-    finally:
-        con.close()
-
-
 def _rows_as_json(columns: list[str], rows: list[tuple]) -> str:
     return json.dumps(
         [{c: _jsonable(v) for c, v in zip(columns, row)} for row in rows],
@@ -550,15 +543,24 @@ def set_read_only() -> str:
 
 
 @server.tool()
-def session_status() -> str:
+def session_status(profile: str = "") -> str:
     """What this session is currently allowed to do.
 
     Worth checking before assuming a failure was the source's fault: a
     refused write may be a restriction the operator set, in which case
     retrying will not help.
+
+    Name a `profile` to additionally ask that source who it thinks you
+    are — on Snowflake that includes `agent_activated`, which reports
+    whether the account will apply agent-specific masking policies to
+    this connection. Expect `FALSE` unless an admin has set up an OAuth
+    security integration with `IS_AGENTIC = TRUE`: lakesh labels its
+    sessions but cannot make itself agent-activated, and believing
+    otherwise means believing a policy applies when it does not. Omit
+    `profile` and no connection is opened.
     """
     restriction = guard.SESSION.effective()
-    return json.dumps({
+    out = {
         "restriction": restriction.as_dict(),
         "summary": restriction.describe(),
         "writes_enabled_by_env": _writes_enabled(),
@@ -569,7 +571,69 @@ def session_status() -> str:
             "local_files_blocked": restriction.read_only and not _duck.ALLOW_LOCAL_FILES,
             "skipped_because": _duck.LAST_SANDBOX_SKIP,
         },
-    })
+        "caller": _duck.CALLER,
+    }
+    if profile:
+        out["source_session"] = _source_session(profile)
+    return json.dumps(out, default=str)
+
+
+def _source_session(profile: str) -> dict:
+    """What the named source reports about a session lakesh opens to it.
+
+    Errors are reported in-band rather than raised: this is a diagnostic,
+    and "I could not ask" is a useful answer where a failed tool call is
+    not.
+    """
+    try:
+        prof = _profile_of(profile)
+    except Exception as e:
+        return {"error": str(e)}
+    if prof.type != "adbc":
+        return {"supported": False,
+                "reason": f"{prof.type} profiles have no server-side session"}
+    try:
+        con, handle = _duck.connect_native(prof, interactive=False)
+    except Exception as e:
+        # A failed connect quotes the statement with the DSN inline.
+        return {"error": scrub(str(e), profile_secrets(prof))}
+    try:
+        reported = _duck.session_probe(con, handle, prof)
+    finally:
+        con.close()
+
+    if reported is None:
+        return {
+            "supported": False,
+            "reason": f"{_dialect.for_profile(prof).name} cannot report on "
+                      f"its own session over this path",
+        }
+    out: dict = {"supported": True, "reported": reported}
+    if "agent_activated" in reported:
+        activated = str(reported["agent_activated"]).upper() == "TRUE"
+        out["agent_activated"] = activated
+        if not activated:
+            out["note"] = (
+                "This session is NOT agent-activated, so any policy keyed on "
+                "IS_AGENT_ACTIVATED will not fire. lakesh cannot set it — a "
+                "session earns it from how it authenticated. Reaching it "
+                "needs an OAuth security integration created with "
+                "IS_AGENTIC = TRUE, or a SERVICE_AGENT user."
+            )
+    if "lakesh_client" in reported:
+        # The label lakesh set, echoed back from the source rather than
+        # from local state — the round trip is the only thing that proves
+        # the stamp actually stuck.
+        out["stamp_confirmed"] = True
+        out["stamp_is_client_asserted"] = True
+    attested = (_duck.LAST_STAMP or {}).get("attested")
+    if attested:
+        # Signed, so unlike the stamp above a policy can act on it — as
+        # far as it trusts the key, which is the caveat that belongs
+        # wherever this is reported.
+        out["attestation"] = dict(attested, client_asserted=False)
+        out["stamp_is_client_asserted"] = False
+    return out
 
 
 _SESSION_MASK: dict[str, str] = {"mode": "off"}
@@ -720,21 +784,23 @@ def list_namespaces(profile: str | None = None) -> str:
     the config's `default`. Returns JSON array of names."""
     try:
         prof = _profile_of(profile)
-        if _prefer_native(prof):
-            with _open_native(profile) as (con, handle, _prof):
-                _cols, rows = _native(con, handle, (
+        with _session(profile) as sess:
+            md = _metadata(sess)
+            if md is not None:
+                rows = [(n,) for n in md.namespaces()]
+            elif sess.queries_source_directly:
+                _cols, rows = sess.run(
                     "SELECT schema_name FROM information_schema.schemata "
                     f"WHERE {_not_system_schemas_for(prof, 'schema_name')} "
                     "ORDER BY 1"
-                ))
-        else:
-            with _open(profile) as (con, catalog):
-                rows = con.execute(
+                )
+            else:
+                rows = sess.execute(
                     "SELECT schema_name FROM information_schema.schemata "
                     "WHERE catalog_name = ? "
                     "  AND schema_name NOT IN ('main','information_schema','pg_catalog') "
                     "ORDER BY 1",
-                    [catalog],
+                    [catalog_alias(sess.profile)],
                 ).fetchall()
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
         return _error(e)
@@ -753,33 +819,38 @@ def list_tables(profile: str | None = None, namespace: str | None = None) -> str
     try:
         prof = _profile_of(profile)
         dialect = freshness.source_dialect(prof)
-        if _prefer_native(prof):
-            # Freshness columns ride on the statement already being sent,
-            # so on Snowflake this costs zero extra round trips.
-            extra = freshness.listing_columns(dialect)
-            sql = (
-                "SELECT t.table_schema, t.table_name"
-                + (f", {extra}" if extra else "")
-                + " FROM information_schema.tables t"
-                + freshness.listing_join(dialect)
-                + f" WHERE {_not_system_schemas_for(prof, 't.table_schema')}"
-            )
-            if namespace:
-                sql += f" AND t.table_schema = {_lit(namespace)}"
-            sql += " ORDER BY 1, 2"
-            with _open_native(profile) as (con, handle, _prof):
-                _cols, rows = _native(con, handle, sql)
-        else:
-            q = ("SELECT table_schema, table_name FROM information_schema.tables "
-                 "WHERE table_catalog = ? "
-                 "  AND table_schema NOT IN ('main','information_schema','pg_catalog')")
-            with _open(profile) as (con, catalog):
-                params: list = [catalog]
+        with _session(profile) as sess:
+            md = _metadata(sess)
+            if md is not None:
+                # A catalog API with no information_schema (Iceberg):
+                # namespaces/tables come from the catalog, freshness does
+                # not (the source cannot report it here).
+                rows = list(md.tables(namespace))
+            elif sess.queries_source_directly:
+                # Freshness columns ride on the statement already being
+                # sent, so on Snowflake this costs zero extra round trips.
+                extra = freshness.listing_columns(dialect)
+                sql = (
+                    "SELECT t.table_schema, t.table_name"
+                    + (f", {extra}" if extra else "")
+                    + " FROM information_schema.tables t"
+                    + freshness.listing_join(dialect)
+                    + f" WHERE {_not_system_schemas_for(prof, 't.table_schema')}"
+                )
+                if namespace:
+                    sql += f" AND t.table_schema = {_lit(namespace)}"
+                sql += " ORDER BY 1, 2"
+                _cols, rows = sess.run(sql)
+            else:
+                q = ("SELECT table_schema, table_name FROM information_schema.tables "
+                     "WHERE table_catalog = ? "
+                     "  AND table_schema NOT IN ('main','information_schema','pg_catalog')")
+                params: list = [catalog_alias(sess.profile)]
                 if namespace:
                     q += " AND table_schema = ?"
                     params.append(namespace)
                 q += " ORDER BY 1, 2"
-                rows = con.execute(q, params).fetchall()
+                rows = sess.execute(q, params).fetchall()
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
         return _error(e)
 
@@ -845,35 +916,42 @@ def describe_table(
         # In `array` shape there is nowhere to put status or freshness,
         # so don't pay for the extra round trip that fetches them.
         want_freshness = resolved_shape == "object"
-        if _prefer_native(prof):
-            with _open_native(profile) as (con, handle, _prof):
-                _cols, rows = _native(con, handle, (
+        with _session(profile) as sess:
+            md = _metadata(sess)
+            if md is not None:
+                # Columns from the catalog API; `is_nullable` as the
+                # 'YES'/'NO' the downstream shaping expects.
+                rows = [
+                    (name, typ, "YES" if nullable else "NO", pos)
+                    for name, typ, nullable, pos in md.columns(namespace, table)
+                ]
+            elif sess.queries_source_directly:
+                _cols, rows = sess.run(
                     "SELECT column_name, data_type, is_nullable, ordinal_position "
                     "FROM information_schema.columns "
                     f"WHERE table_schema = {_lit(namespace)} "
                     f"  AND table_name = {_lit(table)} "
                     "ORDER BY ordinal_position"
-                ))
-                # A second statement, but on the already-open handle —
+                )
+                # A second statement, but on the already-open session —
                 # one more round trip, not a reconnect, and nowhere near
                 # the eager-catalog path that cost minutes.
                 extra = freshness.listing_columns(dialect) if want_freshness else ""
                 if extra:
-                    _c, found = _native(con, handle, (
+                    _c, found = sess.run(
                         f"SELECT {extra} FROM information_schema.tables t"
                         + freshness.listing_join(dialect)
                         + f" WHERE t.table_schema = {_lit(namespace)}"
                         f"   AND t.table_name = {_lit(table)}"
-                    ))
+                    )
                     observed = tuple(found[0]) if found else ()
-        else:
-            with _open(profile) as (con, catalog):
-                rows = con.execute(
+            else:
+                rows = sess.execute(
                     "SELECT column_name, data_type, is_nullable, ordinal_position "
                     "FROM information_schema.columns "
                     "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? "
                     "ORDER BY ordinal_position",
-                    [catalog, namespace, table],
+                    [catalog_alias(sess.profile), namespace, table],
                 ).fetchall()
     except (AuthRequired, ConfigError, duckdb.Error, RuntimeError) as e:
         return _error(e)
@@ -1080,19 +1158,65 @@ def _search_one(
 ) -> tuple[list[dict], int | None, str]:
     """(results, truncated_at, mode) for a single profile."""
     prof = _profile_of(profile_name)
-    if _prefer_native(prof):
-        sql = _wrap_search(_search_sql_native(like, namespace, match, prof), limit)
-        with _open_native(profile_name) as (con, handle, _prof):
-            _cols, rows = _native(con, handle, sql)
-        mode = "native"
-    else:
-        with _open(profile_name) as (con, catalog):
-            body, params = _search_sql_duckdb(like, namespace, match, catalog, prof)
-            rows = con.execute(_wrap_search(body, limit), params).fetchall()
-        mode = "duckdb"
+    with _session(profile_name) as sess:
+        md = _metadata(sess)
+        if md is not None:
+            rows = _search_via_metadata(md, like, namespace, match)
+            mode = "catalog"
+        elif sess.queries_source_directly:
+            sql = _wrap_search(_search_sql_native(like, namespace, match, prof), limit)
+            _cols, rows = sess.run(sql)
+            mode = "native"
+        else:
+            body, params = _search_sql_duckdb(
+                like, namespace, match, catalog_alias(sess.profile), prof)
+            rows = sess.execute(_wrap_search(body, limit), params).fetchall()
+            mode = "duckdb"
 
     truncated = limit if len(rows) > limit else None
     return _group_matches(list(rows)[:limit]), truncated, mode
+
+
+def _like_matcher(like: str):
+    """A predicate for a SQL ILIKE pattern, evaluated in Python for the
+    catalog-API path (an Iceberg catalog has no SQL to run the ILIKE in).
+
+    Handles `%`/`_` wildcards and the `!` escape `search_objects` uses.
+    """
+    import re as _re
+
+    out, i, n = [], 0, len(like)
+    while i < n:
+        c = like[i]
+        if c == "!" and i + 1 < n:      # escaped literal
+            out.append(_re.escape(like[i + 1])); i += 2; continue
+        if c == "%":
+            out.append(".*")
+        elif c == "_":
+            out.append(".")
+        else:
+            out.append(_re.escape(c))
+        i += 1
+    rx = _re.compile("^" + "".join(out) + "$", _re.IGNORECASE)
+    return lambda name: bool(rx.match(name or ""))
+
+
+def _search_via_metadata(md, like: str, namespace: str | None, match: str) -> list[tuple]:
+    """Search rows `(matched_on, schema, table, column, type)` from a
+    catalog API, in the shape `_group_matches` expects."""
+    matches = _like_matcher(like)
+    want = lambda kind: match in ("all", kind)
+    rows: list[tuple] = []
+    for ns, tbl in md.tables(namespace):
+        if want("schema") and matches(ns):
+            rows.append(("schema", ns, tbl, None, None))
+        if want("table") and matches(tbl):
+            rows.append(("table", ns, tbl, None, None))
+        if want("column"):
+            for cname, ctype, _nullable, _pos in md.columns(ns, tbl):
+                if matches(cname):
+                    rows.append(("column", ns, tbl, cname, ctype))
+    return rows
 
 
 @server.tool()
@@ -1228,7 +1352,6 @@ def _estimate_query(
     returning its rows)."""
     policy = policy or _mask.Policy("off")
     out: dict[str, Any] = {"estimate": True, "mode": mode}
-    native = mode == "native"
 
     if want == "count":
         if _is_unwrappable(sql, prof):
@@ -1243,14 +1366,9 @@ def _estimate_query(
             return json.dumps(out)
         probe = _count_probe(sql)
         try:
-            if native:
-                with _open_native(profile_name, timeout) as (con, handle, _p):
-                    with deadline(con, timeout):
-                        rows = adbc_native_scan(con, handle, probe).fetchall()
-            else:
-                with _open(profile_name) as (con, _catalog):
-                    with deadline(con, timeout):
-                        rows = con.execute(probe).fetchall()
+            with _session(profile_name, timeout) as sess:
+                with deadline(sess, timeout):
+                    _cols, rows = sess.run(probe)
         except QueryTimeout as e:
             return json.dumps({
                 "error": scrub(str(e), _KNOWN_SECRETS), "error_type": "timeout",
@@ -1267,32 +1385,30 @@ def _estimate_query(
 
     # want == "plan"
     #
-    # Branch on the DIALECT, not on whether we happen to be on the native
-    # path. `EXPLAIN USING JSON` is Snowflake's spelling and nothing
-    # else's, and it used to be sent to every native source.
-    if native:
-        source = _dialect.for_profile(prof)
-        explain = _dialect.explain_sql(source, sql)
-        if explain is None:
-            out["method"] = "unavailable"
-            out["reason"] = (
-                _POSTGRES_NO_EXPLAIN if source.name == "postgres" else
-                f"the {source.name} profile has no plan available over the "
-                f"native path. Re-run with estimate=\"count\" for an exact "
-                f"count, or native=false to plan through DuckDB."
-            )
-            return json.dumps(out)
-    else:
-        explain = f"EXPLAIN (FORMAT json) {sql}"
+    # Branch on the DIALECT (via the session), not on which path we happen
+    # to be on. `EXPLAIN USING JSON` is Snowflake's spelling and nothing
+    # else's; a source-direct session (native ADBC or a Python driver)
+    # uses the dialect's spelling, an attached DuckDB one uses DuckDB's.
+    used_duckdb_explain = False
     try:
-        if native:
-            with _open_native(profile_name, timeout) as (con, handle, _p):
-                with deadline(con, timeout):
-                    rows = adbc_native_scan(con, handle, explain).fetchall()
-        else:
-            with _open(profile_name) as (con, _catalog):
-                with deadline(con, timeout):
-                    rows = con.execute(explain).fetchall()
+        with _session(profile_name, timeout) as sess:
+            if sess.queries_source_directly:
+                source = _dialect.for_profile(prof)
+                explain = _dialect.explain_sql(source, sql)
+                if explain is None:
+                    out["method"] = "unavailable"
+                    out["reason"] = (
+                        _POSTGRES_NO_EXPLAIN if source.name == "postgres" else
+                        f"the {source.name} profile has no plan available over "
+                        f"the native path. Re-run with estimate=\"count\" for "
+                        f"an exact count, or native=false to plan through DuckDB."
+                    )
+                    return json.dumps(out)
+            else:
+                explain = f"EXPLAIN (FORMAT json) {sql}"
+                used_duckdb_explain = True
+            with deadline(sess, timeout):
+                _cols, rows = sess.run(explain)
     except QueryTimeout as e:
         return json.dumps({
             "error": scrub(str(e), _KNOWN_SECRETS), "error_type": "timeout",
@@ -1312,9 +1428,10 @@ def _estimate_query(
     out["plan"] = _mask.mask_text(policy, "\n".join(
         str(cell) for row in rows for cell in row if cell is not None
     ))
-    if not native:
-        # Parsed only where the shape is known and tested. Snowflake's
-        # plan is passed through verbatim rather than guessed at.
+    if used_duckdb_explain:
+        # Parsed only where the shape is known and tested — DuckDB's
+        # `EXPLAIN (FORMAT json)`. A source's own plan is passed through
+        # verbatim rather than guessed at.
         rows_estimate = _duckdb_cardinality(rows)
         if rows_estimate is not None:
             out["estimated_rows"] = rows_estimate
@@ -1466,11 +1583,17 @@ def query(
             "environment to enable writes."
         )
 
-    use_native = _prefer_native(prof) if native is None else bool(native)
-    if use_native and prof.type != "adbc":
+    # `native` is an ADBC concept (source passthrough vs DuckDB's attached
+    # catalog); it only applies to adbc profiles. A python backend always
+    # queries its source directly, and iceberg/ducklake always go through
+    # DuckDB.
+    if prof.type == "adbc":
+        use_native = _prefer_native(prof) if native is None else bool(native)
+    else:
         use_native = False
-
-    mode = "native" if use_native else "duckdb"
+    mode = ("native" if use_native
+            else "python" if prof.type == "python"
+            else "duckdb")
     timeout = _effective_timeout(prof, timeout_s)
 
     want_estimate = _estimate_mode(estimate)
@@ -1486,34 +1609,34 @@ def query(
                          "estimate describes the whole statement, not a page.",
             })
         return _estimate_query(profile, prof, sql, mode, want_estimate, timeout, policy)
-    # A hard deadline needs DuckDB to be the one blocked. In native mode
-    # the statement sits inside the driver, which does not observe the
-    # interrupt until it returns.
-    enforced = "best_effort" if (use_native and timeout) else (
+    # A hard deadline needs DuckDB to be the one blocked. Only the
+    # attached-catalog path (DuckDB executes) can be interrupted hard; a
+    # source-direct session (native ADBC or a Python driver) sits inside
+    # the driver, which does not observe the interrupt until it returns.
+    source_direct = use_native or prof.type == "python"
+    enforced = "best_effort" if (source_direct and timeout) else (
         "hard" if timeout else "none"
     )
     paged_sql, wrapped = _paginate(sql, limit, offset, prof)
     # One row past the limit, so "exactly `limit` rows" is distinguishable
     # from "more to come" instead of guessed at.
     want = limit + 1
+    is_read = _is_read_only(sql)
 
     try:
-        if use_native:
-            with _open_native(profile, timeout) as (con, handle, _prof):
-                with deadline(con, timeout):
-                    cur = adbc_native_scan(con, handle, paged_sql)
+        with _session(profile, timeout, native=use_native) as sess:
+            with deadline(sess, timeout):
+                if is_read:
+                    cur = sess.execute(paged_sql)
                     columns = [d[0] for d in cur.description] if cur.description else []
                     if offset and not wrapped:
                         cur.fetchmany(offset)   # unwrappable: skip client-side
                     rows = cur.fetchmany(want)
-        else:
-            with _open(profile) as (con, _catalog):
-                with deadline(con, timeout):
-                    cur = con.execute(paged_sql)
-                    columns = [d[0] for d in cur.description] if cur.description else []
-                    if offset and not wrapped:
-                        cur.fetchmany(offset)
-                    rows = cur.fetchmany(want)
+                else:
+                    # A write. run() sends it once — pushing a write through
+                    # the paging cursor would double-execute it on the ADBC
+                    # path (see duck.adbc_native_scan).
+                    columns, rows = sess.run(paged_sql)
     except QueryTimeout as e:
         return json.dumps({
             "error": scrub(str(e), _KNOWN_SECRETS),
@@ -1592,6 +1715,10 @@ def serve(config_path: Path | None = None, read_only: bool = False) -> None:
         # Policy layer: set before any tool runs, so it applies to every
         # call and cannot be relaxed by one.
         guard.SESSION.set_policy_flag("lakesh mcp --read-only")
+    # Every connection this process opens is agent-driven, so the source's
+    # audit trail should say so. Set before any tool runs, for the same
+    # reason as the policy flag above.
+    _duck.CALLER = "mcp"
     server.run()
 
 

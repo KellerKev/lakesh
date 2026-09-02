@@ -150,6 +150,17 @@ def profile_secrets(profile: "Profile") -> set[str]:
     add(profile.s3.secret_key)
     add(profile.s3.session_token)
     add(profile.oauth.client_secret)
+    signing = getattr(profile, "signing", None)
+    if signing is not None:
+        # The key itself, not just the path: a driver error can quote a
+        # statement, and a signing key that reaches an error string has
+        # already left the machine.
+        try:
+            from .attest import load_private_key
+
+            add(load_private_key(profile)[1])
+        except Exception:
+            pass          # unreadable key is the caller's problem, not ours
     return secrets
 
 

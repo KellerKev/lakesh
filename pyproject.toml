@@ -49,6 +49,20 @@ dependencies = [
 # shipped rules need lookarounds (RE2 has none) and stay on `re`, so the
 # base install is unaffected.
 mask = ["google-re2"]
+# Signed session attestation. Off by default because most profiles only
+# need the client-asserted stamp; a signature is only worth its weight
+# when a policy on the source actually verifies it.
+sign = ["pyjwt>=2.8", "cryptography>=42"]
+# Python query backends (type = "python"). Each wraps a PEP 249 driver
+# behind lakesh's Session interface; the base install ships none of them
+# because the ADBC path is the default. `duckdb` needs no extra — it is
+# already a core dependency and serves as the reference backend.
+snowflake-python = ["snowflake-connector-python>=3.12"]
+postgres-python = ["psycopg[binary]>=3.1"]
+# pyiceberg backend: the data-pull family. Metadata from the catalog API,
+# data scanned to Arrow and queried in an in-process DuckDB — for Iceberg
+# catalogs (incl. non-REST: Glue, Hive, SQL) with no information_schema.
+iceberg-python = ["pyiceberg[pyarrow]>=0.10,<1"]
 dev = [
     "pytest>=8,<9",
     "pytest-asyncio>=0.23",

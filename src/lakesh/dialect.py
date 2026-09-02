@@ -47,6 +47,18 @@ def _sf_quote(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def _pg_quote(value: str) -> str:
+    """Single-quoted literal for Postgres.
+
+    Doubling the quote is the standard-SQL escape; Postgres treats a
+    backslash inside a plain literal as an ordinary character (unless
+    `standard_conforming_strings` is off, which has not been the default
+    since 9.1), so `_sf_quote`'s backslash form would corrupt the value
+    here rather than escape it.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 @dataclass(frozen=True)
 class StageOps:
     """How an engine moves a local file to where it can read it.
@@ -110,6 +122,114 @@ _SNOWFLAKE_STAGE = StageOps(
 )
 
 
+# A logical variable name, before any engine-specific prefixing. Kept
+# stricter than `QUALIFIED_NAME_RE` — no dots, because each engine
+# imposes its own namespace convention and a caller supplying one would
+# collide with it.
+BARE_NAME_RE = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+@dataclass(frozen=True)
+class SessionContext:
+    """How a client can label its own session on this engine.
+
+    ### This is attribution, not access control
+
+    Everything here is **client-asserted**: the same credentials that set
+    `LAKESH_CLIENT = 'mcp'` can set it to `'cli'`, or leave it unset. A
+    masking policy branching on it is trusting whoever holds the
+    credentials, which is a materially weaker claim than it looks.
+
+    Snowflake's own `IS_AGENT_ACTIVATED` is the counter-example and the
+    reason this distinction is drawn in the type: it is derived from how
+    the session authenticated, so a client cannot influence it — which is
+    exactly what makes it trustworthy and what makes it unsettable.
+    `probe` reads it; nothing here can turn it on.
+    """
+
+    tag: Callable[[str], str] | None = None
+    """(label) -> SQL putting a label in the engine's audit trail."""
+    variable: Callable[[str, str], str] | None = None
+    """(bare_name, value) -> SQL setting a session variable the engine's
+    own SQL can read back. The callable applies the engine's namespace
+    convention; callers pass an unprefixed name."""
+    probe: str | None = None
+    """SQL returning one row describing who the engine thinks we are.
+    Columns vary by engine on purpose — a field the engine cannot report
+    is absent rather than false."""
+    session_id: str | None = None
+    """SQL returning this session's id, to bind an attestation to. None
+    means the engine cannot identify its own session, and attestation is
+    therefore unavailable — an unbound token would be replayable."""
+    attest: Callable[[str], str] | None = None
+    """(jwt) -> SQL publishing a signed attestation the engine's policies
+    can verify. Unlike everything else here this is *not* client-asserted:
+    the value is signed, so a policy can trust it as far as it trusts the
+    key. See `attest`."""
+
+
+_SNOWFLAKE_SESSION = SessionContext(
+    tag=lambda label: f"ALTER SESSION SET QUERY_TAG = {_sf_quote(label)}",
+    # Snowflake session variables are flat and unnamespaced, so the
+    # LAKESH_ prefix is what keeps this from colliding with an operator's
+    # own variables.
+    variable=lambda name, value: f"SET LAKESH_{name.upper()} = {_sf_quote(value)}",
+    # Verified against a live account: every column returns, and both
+    # SYS_CONTEXT and GETVARIABLE are callable from a masking policy body
+    # (tested by creating one), which is what makes reporting them useful
+    # rather than trivia.
+    probe=(
+        "SELECT SYS_CONTEXT('SNOWFLAKE$CURRENT','IS_AGENT_ACTIVATED')"
+        " AS agent_activated,"
+        " CURRENT_USER() AS user_name, CURRENT_ROLE() AS role_name,"
+        " CURRENT_CLIENT() AS client,"
+        " GETVARIABLE('LAKESH_CLIENT') AS lakesh_client"
+    ),
+    session_id="SELECT CURRENT_SESSION() AS sid",
+    attest=lambda jwt: f"SET LAKESH_ATTEST = {_sf_quote(jwt)}",
+)
+
+_DUCKDB_SESSION = SessionContext(
+    # No `tag`: DuckDB is in-process and has no audit trail for one to
+    # land in. What it does have is real session variables — `SET
+    # VARIABLE` / `getvariable`, verified on 1.5.2, and usable in a
+    # predicate.
+    #
+    # Be clear-eyed about what this is worth. Nothing server-side reads
+    # it, so unlike Snowflake it cannot drive a masking policy; it labels
+    # the process for anything running inside it. The signal that
+    # actually crosses the wire on this path is the HTTP User-Agent,
+    # which `duck._duckdb_connect` sets at connect time — that is what an
+    # Iceberg REST catalog such as duckicelake can see.
+    variable=lambda name, value: (
+        f"SET VARIABLE lakesh_{name.lower()} = {_pg_quote(value)}"),
+    probe=(
+        "SELECT getvariable('lakesh_client') AS lakesh_client,"
+        " current_setting('custom_user_agent') AS client"
+    ),
+)
+
+_POSTGRES_SESSION = SessionContext(
+    # `false` = session scope, not transaction scope: the ADBC driver
+    # wraps statements in its own transactions, so a transaction-scoped
+    # setting would be gone by the next call.
+    tag=lambda label: (
+        f"SELECT set_config('application_name', {_pg_quote(label)}, false)"),
+    # Postgres only accepts a custom setting if it is namespaced with a
+    # dot; a bare name raises "unrecognized configuration parameter".
+    variable=lambda name, value: (
+        f"SELECT set_config('lakesh.{name.lower()}', {_pg_quote(value)}, false)"),
+    # No agent-activation concept exists, so no such column is reported —
+    # absent rather than false, the same rule freshness follows for a
+    # timestamp the source cannot supply.
+    probe=(
+        "SELECT current_user AS user_name,"
+        " current_setting('application_name') AS client,"
+        " current_setting('lakesh.client', true) AS lakesh_client"
+    ),
+)
+
+
 @dataclass(frozen=True)
 class Dialect:
     """One engine's capabilities. Absent capability = `None` or empty."""
@@ -141,6 +261,10 @@ class Dialect:
     concept reachable over this path — DuckLake and Iceberg would stage
     to object storage instead, which is a different implementation of the
     same capability and not yet written."""
+    session: "SessionContext | None" = None
+    """How to label a session, and how to ask what the engine makes of
+    it. None means the engine offers nothing — DuckDB has no server-side
+    session for anyone to attribute a query to."""
 
     def is_system_schema(self, name: str) -> bool:
         return str(name).lower() in self.system_schemas
@@ -163,6 +287,7 @@ _DUCKDB = Dialect(
         "ducklake_last_committed_snapshot", "ducklake_table_insertions",
         "ducklake_table_deletions",
     }),
+    session=_DUCKDB_SESSION,
 )
 
 _POSTGRES = Dialect(
@@ -182,6 +307,7 @@ _POSTGRES = Dialect(
     freshness_join=(
         " LEFT JOIN pg_namespace n ON n.nspname = t.table_schema"
         " LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name"),
+    session=_POSTGRES_SESSION,
 )
 
 _SNOWFLAKE = Dialect(
@@ -201,6 +327,7 @@ _SNOWFLAKE = Dialect(
         "explain", "pragma", "show", "desc", "describe", "list", "call",
         "use", "get", "put", "remove", "execute"),
     stage=_SNOWFLAKE_STAGE,
+    session=_SNOWFLAKE_SESSION,
 )
 
 _ANSI = Dialect(name="ansi")
@@ -311,3 +438,44 @@ def stage_ops(profile: Profile) -> "StageOps | None":
     `PUT` to an engine that has no such statement.
     """
     return for_profile(profile).stage
+
+
+def session_context(profile: Profile) -> "SessionContext | None":
+    """How to label this profile's sessions, or None if it cannot be."""
+    return for_profile(profile).session
+
+
+def session_probe_sql(profile: Profile) -> str | None:
+    """SQL asking the engine who it thinks we are, or None."""
+    ctx = session_context(profile)
+    return ctx.probe if ctx else None
+
+
+def session_stamp_sql(
+    dialect: Dialect, label: str, variables: dict[str, str],
+) -> list[str]:
+    """The statements that label a session on this engine.
+
+    Empty when the engine has no such concept — the caller stamps nothing
+    rather than emitting an `ALTER SESSION` to DuckDB. A variable whose
+    name is not a plain identifier is a programming error rather than
+    something to quote around, because these names end up in SQL that
+    operators write policies against; it raises.
+    """
+    ctx = dialect.session
+    if ctx is None:
+        return []
+    out: list[str] = []
+    if label and ctx.tag:
+        out.append(ctx.tag(label))
+    if ctx.variable:
+        for name, value in variables.items():
+            if not BARE_NAME_RE.match(str(name)):
+                raise ValueError(
+                    f"{name!r} is not a plain session-variable name. Use "
+                    f"letters, digits and underscores — each engine adds "
+                    f"its own namespace prefix, so a qualified name would "
+                    f"collide with it."
+                )
+            out.append(ctx.variable(str(name), str(value)))
+    return out
