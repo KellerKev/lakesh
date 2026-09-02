@@ -1021,10 +1021,10 @@ agent is behind it, so the engine's audit trail can tell them apart:
 
 | profile | audit label | readable variable | what the source sees |
 |---|---|---|---|
-| Snowflake (ADBC) | `QUERY_TAG` | `LAKESH_CLIENT` | both, plus `QUERY_HISTORY` |
-| Postgres (ADBC) | `application_name` | `lakesh.client` | both, in `pg_stat_activity` |
-| DuckLake | — | `lakesh_client` (DuckDB) | its **Postgres metastore**, via `application_name` in the DSN |
 | Iceberg REST / duckicelake | — | `lakesh_client` (DuckDB) | the HTTP **User-Agent** |
+| DuckLake | — | `lakesh_client` (DuckDB) | its **Postgres metastore**, via `application_name` in the DSN |
+| Postgres (ADBC) | `application_name` | `lakesh.client` | both, in `pg_stat_activity` |
+| Snowflake (ADBC) | `QUERY_TAG` | `LAKESH_CLIENT` | both, plus `QUERY_HISTORY` |
 | anything else (ANSI) | — | — | nothing — reported as unavailable |
 
 Set at connect time, because none of them survive a new connection and
@@ -1042,18 +1042,46 @@ team = "data-eng"                # extra variables alongside `client`
 **This is attribution, not access control.** The value is
 client-asserted: the same credentials that set `LAKESH_CLIENT = 'mcp'`
 can set it to anything, or leave it unset. A masking policy *can* read it
-— `GETVARIABLE` is callable from a policy body, verified by creating one
-— but such a policy is trusting the client to be honest about itself.
+where the source has one, but such a policy is trusting the client to be
+honest about itself.
 
-Two path caveats, both measured. On **DuckDB-hosted engines** the
-variable is local to the process, so nothing server-side reads it; the
-signals that actually cross the wire there are the metastore's
-`application_name` and the HTTP User-Agent. And an **ADBC profile
-reached through the attached-catalog path** (without `--native`) has no
-handle to send the statement down, so it reports `stamped: false` with a
-reason rather than pretending.
+The mechanism differs enough per source to be worth spelling out:
 
-#### Snowflake agent activation, over ADBC vs. the Python backend
+- **Iceberg REST / duckicelake** — the catalog runs in-process in DuckDB,
+  so the `lakesh_client` variable is local to the process and nothing on
+  the catalog side reads it. The signal that actually reaches the catalog
+  is the **HTTP User-Agent** (`lakesh/<version> <caller>`, set at connect
+  time) — duckicelake can key governance on it.
+- **DuckLake** — also in-process DuckDB, so the same process-local
+  caveat. What crosses the wire is the **Postgres metastore**:
+  `application_name` in its DSN, visible in that database's
+  `pg_stat_activity`.
+- **Postgres** (ADBC) — `application_name` plus a `lakesh.client`
+  setting, both visible in `pg_stat_activity`.
+- **Snowflake** (ADBC) — `QUERY_TAG` (audit trail, lands in
+  `QUERY_HISTORY`) plus a `LAKESH_CLIENT` session variable a masking
+  policy can read (`GETVARIABLE` is callable from a policy body, verified
+  by creating one). It can go further than a client-asserted label — see
+  [Going further on Snowflake](#going-further-on-snowflake-activation-and-unforgeable-labels)
+  below (agent activation and signed attestation).
+- **Anything else** (ANSI) — no session-context mechanism lakesh can
+  reach; reported as unavailable rather than faked.
+
+One cross-cutting caveat: an **ADBC profile reached through the
+attached-catalog path** (without `--native`) has no handle to send the
+label statement down, so it reports `stamped: false` with a reason rather
+than pretending it labelled the session.
+
+### Going further on Snowflake: activation and unforgeable labels
+
+The label above is client-asserted attribution, and on most engines that
+is where it stops. **Snowflake** goes two steps further — and both hang
+off things only Snowflake has (its login-derived agent signal and its
+masking-policy engine), so this whole section is Snowflake-specific.
+The [next topic](#read-only-sessions) returns to behaviour common to
+every source.
+
+#### Agent activation, over ADBC vs. the Python backend
 
 Snowflake can apply policies keyed on
 `SYS_CONTEXT('SNOWFLAKE$CURRENT', 'IS_AGENT_ACTIVATED')`, derived from the
