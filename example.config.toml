@@ -256,10 +256,13 @@ path_style = true
 # backend = "snowflake"          # duckdb | snowflake | postgres | pyiceberg | module:callable
 # dialect = "snowflake"
 #
+# # Agent activation is OFF by default (honest label). Opt in to make MCP
+# # sessions present as Cortex Code so agent-masking policies apply -- this
+# # impersonates a first-party client (audit trail records Cortex Code);
+# # see the README. Or LAKESH_SNOWFLAKE_AGENT_ACTIVATION=1 server-wide.
+# agent_activation = true
+#
 # [profiles.snow_py.options]     # passed to the driver's connect()
 # account   = "myorg-account1"
 # warehouse = "MY_WH"
-# # application override: default activates agent-masking (cortex_code_cli)
-# # over MCP; set an honest value to opt out. Writes a false Cortex
-# # identity into the audit trail when activating -- see the README.
-# # application = "lakesh/mcp"
+# # application = "cortex_code_cli"   # explicit override wins over the flag

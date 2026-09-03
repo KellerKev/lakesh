@@ -291,6 +291,21 @@ class Profile:
     own tooling owns `QUERY_TAG`."""
     query_tag: str = ""
     """Override the session label. Empty means `lakesh/<version> <caller>`."""
+    agent_activation: bool = False
+    """Opt in to Snowflake agent activation over MCP (python `snowflake`
+    backend only).
+
+    Off by default, and honestly so: the only application strings Snowflake
+    accepts as agent-active are its own Cortex Code client identifiers
+    (`cortex_code_cli` / `cortex_code_desktop`), so turning this on makes
+    lakesh **present as Cortex Code** — `IS_AGENT_ACTIVATED = TRUE`,
+    `AGENT_TYPE = CORTEX_LITE_AGENT` in the account's audit trail. That is
+    impersonation of a first-party client on an undocumented allowlist;
+    there is no honest string that activates (the honest route is an
+    `IS_AGENTIC = TRUE` OAuth integration or a SERVICE_AGENT user, set up
+    account-side). Enable only with eyes open. The server-wide env var
+    `LAKESH_SNOWFLAKE_AGENT_ACTIVATION` sets the same default for every
+    profile; an explicit `options.application` still wins over both."""
     signing: "SigningConfig | None" = None
     """Signed attestation. None means the stamp stays client-asserted."""
     session_variables: dict[str, str] = field(default_factory=dict)
@@ -851,6 +866,7 @@ def _parse_profile(name: str, raw: dict) -> Profile:
             str(n) for n in (raw.get("read_procedures") or [])),
         session_context=bool(raw.get("session_context", True)),
         query_tag=str(raw.get("query_tag", "")),
+        agent_activation=bool(raw.get("agent_activation", False)),
         signing=_parse_signing(name, raw.get("signing")),
         session_variables={
             str(k): str(v) for k, v in (raw.get("session_variables") or {}).items()},
@@ -1185,7 +1201,9 @@ path_style = true
 # [profiles.snow_py.options]     # passed to the driver's connect()
 # account   = "myorg-account1"
 # warehouse = "MY_WH"
-# # application override: default activates agent-masking (cortex_code_cli)
-# # over MCP; set an honest value to opt out -- see the README.
-# # application = "lakesh/mcp"
+# # Agent activation is OFF by default (honest label). Opt in to make
+# # MCP sessions present as Cortex Code so agent-masking policies apply --
+# # this impersonates a first-party client; see the README.
+# agent_activation = true              # or LAKESH_SNOWFLAKE_AGENT_ACTIVATION=1
+# # application = "cortex_code_cli"    # explicit override wins over the flag
 """

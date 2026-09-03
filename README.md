@@ -407,40 +407,55 @@ snowflake` — same library name, a drop-in for the `driver` path in an
 `backend = "snowflake"` profile, which uses `snowflake-connector-python`
 and needs no `.so`.
 
-### Agent activation
+### Agent activation (opt-in)
 
 Snowflake can apply agent-specific masking policies when a session is
-*agent-activated* (`SYS_CONTEXT('SNOWFLAKE$CURRENT','IS_AGENT_ACTIVATED')`).
-That is set from the login's `application` name, and the **ADBC driver
-mangles it** (it force-prepends `[ADBC][Go-…]`), so an ADBC session can
-never present the value Snowflake's allowlist accepts —
-`agent_activated` is always `FALSE`.
+*agent-activated* (`SYS_CONTEXT('SNOWFLAKE$CURRENT','IS_AGENT_ACTIVATED')`),
+set from the login's `application` name. Two facts, both measured:
 
-The **python `snowflake` backend can**, because
-`snowflake-connector-python` sends `application` verbatim. Measured end
-to end:
+- The **ADBC driver can't reach it** — it force-prepends `[ADBC][Go-…]`
+  to the application name, so the allowlist never sees the bare value.
+- The only strings Snowflake accepts are **its own Cortex Code
+  identifiers** — `cortex_code_cli` and `cortex_code_desktop` (exact
+  match, case-insensitive; every other value, including `external_agent`,
+  `cortex_agent`, `mcp`, `snowflake_mcp`, tested `FALSE`). There is **no
+  honest string** a third-party tool can send.
 
-| driving lakesh | `application` sent | `agent_activated` |
-|---|---|---|
-| MCP (an agent) | `cortex_code_cli` (default) | **`TRUE`** |
-| CLI (a human) | `lakesh/<version> cli` | `FALSE` |
+So lakesh is **honest by default** — it sends `lakesh/<version> <caller>`,
+which does not activate. Activating means **impersonating Cortex Code**,
+so it is a deliberate, one-line opt-in on the python `snowflake` backend:
 
-So over MCP the backend **defaults to activating** agent-masking — the
-governance-positive outcome when an agent is driving — while a human at
-the CLI stays honestly labelled and is not treated as an agent.
+```toml
+[profiles.warehouse]
+type    = "python"
+backend = "snowflake"          # required — ADBC can't activate
+dialect = "snowflake"
+agent_activation = true        # opt in; sends cortex_code_cli over MCP
+```
 
-> **The tradeoff, stated plainly.** `cortex_code_cli` is Cortex Code's
-> identity, so activating this way records the session as Cortex Code
-> (`AGENT_TYPE = CORTEX_LITE_AGENT`) in your account's audit trail. It
-> rides an **undocumented allowlist** Snowflake can change at any time.
-> To label honestly instead, set `application` yourself:
->
-> ```toml
-> [profiles.warehouse.options]
-> application = "lakesh/mcp"    # honest; does not activate
-> ```
->
-> Check what a session actually is with `lakesh profiles show <p> --probe`.
+or turn it on for the whole MCP server without touching profiles:
+
+```bash
+LAKESH_SNOWFLAKE_AGENT_ACTIVATION=1 lakesh mcp
+```
+
+When enabled, an **MCP (agent) session** sends `cortex_code_cli` and
+activates; a **human at the CLI is never impersonated** (activation is
+about an agent driving). An explicit `options.application` overrides
+everything.
+
+The MCP `session_status(profile=…)` tool **surfaces this option** on any
+Snowflake profile — whether it's on, how to enable it, and what it costs
+— so an agent can offer it to the user rather than it being buried here.
+
+> **What enabling it means, plainly.** `cortex_code_cli` is Cortex Code's
+> identity, so the session records as Cortex Code
+> (`AGENT_TYPE = CORTEX_LITE_AGENT`) in your account's audit trail, on an
+> **undocumented allowlist** Snowflake can change at any time. The
+> *honest* activation path is `AGENT_TYPE = EXTERNAL_AGENT` via an admin
+> creating an OAuth integration with `IS_AGENTIC = TRUE` or a
+> `SERVICE_AGENT` user (both set up account-side, not by a client string)
+> — see [Going further on Snowflake](#going-further-on-snowflake-activation-and-unforgeable-labels).
 
 ### Snowflake profile
 
@@ -1093,10 +1108,12 @@ login's `application` name. There are three ways this plays out, and
   `SYSTEM$SET_SESSION_CONTEXT` both error), and the ADBC driver
   force-prefixes the application name with `[ADBC][Go-…]`, so Snowflake's
   allowlist never sees the bare value.
-- **The Python `snowflake` backend reaches it**, because it sends
-  `application` verbatim — see [Agent activation](#agent-activation).
+- **The Python `snowflake` backend reaches it** (opt-in), because it
+  sends `application` verbatim — but only the Cortex Code markers
+  activate, so this is impersonation you enable deliberately with
+  `agent_activation = true`. See [Agent activation](#agent-activation-opt-in).
 - **Or authenticate through an agentic OAuth integration** (below), which
-  earns it from the authentication itself.
+  earns it honestly from the authentication itself (`EXTERNAL_AGENT`).
 
 Either way, lakesh **reports the truth** so you never assume a policy
 applies when it does not:

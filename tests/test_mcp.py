@@ -120,6 +120,44 @@ def test_list_profiles_shape(config_file):
     assert isinstance(out, list)
     assert any(p["name"] == "it" and p["default"] for p in out)
     assert all(p["type"] in ("iceberg-rest", "ducklake") for p in out)
+    # non-Snowflake profiles don't carry the agent-activation flag
+    assert all("agent_activation" not in p for p in out)
+
+
+def test_list_profiles_surfaces_snowflake_agent_activation(tmp_path, monkeypatch):
+    """An agent enumerating profiles sees the activation option up front,
+    without having to call session_status first."""
+    p = tmp_path / "config.toml"
+    p.write_text("""
+default = "sf"
+
+[profiles.sf]
+type    = "python"
+backend = "snowflake"
+dialect = "snowflake"
+
+[profiles.sf.options]
+account = "acme-test"
+
+[profiles.sf_on]
+type    = "python"
+backend = "snowflake"
+dialect = "snowflake"
+agent_activation = true
+
+[profiles.sf_on.options]
+account = "acme-test"
+""")
+    monkeypatch.setenv("LAKESH_CONFIG", str(p))
+    monkeypatch.delenv("LAKESH_SNOWFLAKE_AGENT_ACTIVATION", raising=False)
+    by_name = {e["name"]: e for e in json.loads(lakesh_mcp.list_profiles())}
+
+    off = by_name["sf"]["agent_activation"]
+    assert off["available"] is True and off["enabled"] is False
+    assert "OFF" in off["note"]
+
+    on = by_name["sf_on"]["agent_activation"]
+    assert on["enabled"] is True and "ON" in on["note"]
 
 
 # --------------------------------------------------------------------------

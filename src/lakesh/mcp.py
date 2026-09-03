@@ -490,8 +490,10 @@ server = FastMCP(
 @server.tool()
 def list_profiles() -> str:
     """List all configured catalog profiles. Returns JSON: each entry has
-    `name`, `type` (`iceberg-rest`, `ducklake`, or `adbc`), and a
-    one-line `description` of where it points."""
+    `name`, `type` (`iceberg-rest`, `ducklake`, `adbc`, or `python`), and a
+    one-line `description` of where it points. Snowflake profiles also carry
+    an `agent_activation` flag (whether Cortex-Code agent-masking can be /
+    is enabled); call `session_status` for the full explanation."""
     cfg = _load_or_raise()
     out = []
     for name in sorted(cfg.profiles):
@@ -517,6 +519,21 @@ def list_profiles() -> str:
             entry["status"] = p.status
         if p.max_staleness_seconds:
             entry["max_staleness_seconds"] = p.max_staleness_seconds
+        if _is_snowflake_profile(p):
+            # Let an agent enumerating profiles see the option up front —
+            # session_status(profile) returns the full explanation.
+            enabled = _backend.agent_activation_opted_in(p)
+            entry["agent_activation"] = {
+                "available": True,
+                "enabled": bool(enabled),
+                "note": (
+                    "Snowflake agent-masking can be activated for MCP "
+                    "sessions (impersonates Cortex Code); "
+                    + ("currently ON. " if enabled else "currently OFF. ")
+                    + "Call session_status for what it means and how to "
+                    "enable it."
+                ),
+            }
         out.append(entry)
     return json.dumps(out)
 
@@ -578,6 +595,58 @@ def session_status(profile: str = "") -> str:
     return json.dumps(out, default=str)
 
 
+def _is_snowflake_profile(p: Profile) -> bool:
+    """A profile that reaches Snowflake, either backend — python snowflake
+    or the ADBC snowflake driver. Agent activation is offered on both, but
+    only the python backend can actually deliver it (the ADBC driver
+    mangles the application name)."""
+    return (p.type == "python" and p.backend == "snowflake") or \
+           (p.type == "adbc" and p.driver == "snowflake")
+
+
+def _agent_activation_hint(prof: Profile, activated: bool | None) -> dict:
+    """Tell the caller they have the option to make a Snowflake session
+    agent-active — and, plainly, what enabling it means.
+
+    This is the "let the user know they have the option" surface: it
+    appears in `session_status` for any Snowflake profile, whether or not
+    it is currently activated.
+    """
+    opted_in = _backend.agent_activation_opted_in(prof)
+    is_python_sf = prof.type == "python" and prof.backend == "snowflake"
+    hint: dict = {
+        "available": True,
+        "enabled": bool(opted_in),
+        "currently_active": activated,
+        "what_it_does": (
+            "sends application=cortex_code_cli, which makes Snowflake treat "
+            "the session as its own Cortex Code client "
+            "(IS_AGENT_ACTIVATED=TRUE, AGENT_TYPE=CORTEX_LITE_AGENT) so "
+            "agent-masking policies apply. This is IMPERSONATION of a "
+            "first-party client on an undocumented allowlist — it lands in "
+            "the account's audit trail as Cortex Code, not lakesh."
+        ),
+        "honest_alternative": (
+            "for honest activation (AGENT_TYPE=EXTERNAL_AGENT) have an admin "
+            "create an OAuth integration with IS_AGENTIC=TRUE, or a "
+            "SERVICE_AGENT user — no client string can do it honestly."
+        ),
+    }
+    if not is_python_sf:
+        hint["requires"] = (
+            "the python snowflake backend (type=\"python\", "
+            "backend=\"snowflake\") — the ADBC driver mangles the "
+            "application name so it cannot activate. Switch this profile to "
+            "the python backend to use it."
+        )
+    if not opted_in:
+        hint["how_to_enable"] = (
+            "set agent_activation = true on the profile, or "
+            "LAKESH_SNOWFLAKE_AGENT_ACTIVATION=1 for the whole MCP server."
+        )
+    return hint
+
+
 def _source_session(profile: str) -> dict:
     """What the named source reports about a session lakesh opens to it.
 
@@ -589,37 +658,32 @@ def _source_session(profile: str) -> dict:
         prof = _profile_of(profile)
     except Exception as e:
         return {"error": str(e)}
-    if prof.type != "adbc":
-        return {"supported": False,
-                "reason": f"{prof.type} profiles have no server-side session"}
     try:
-        con, handle = _duck.connect_native(prof, interactive=False)
+        sess = _backend.open_session(prof, interactive=False)
     except Exception as e:
         # A failed connect quotes the statement with the DSN inline.
         return {"error": scrub(str(e), profile_secrets(prof))}
     try:
-        reported = _duck.session_probe(con, handle, prof)
+        reported = sess.probe()
     finally:
-        con.close()
+        sess.close()
 
+    is_snowflake = _dialect.for_profile(prof).name == "snowflake"
     if reported is None:
-        return {
+        out: dict = {
             "supported": False,
             "reason": f"{_dialect.for_profile(prof).name} cannot report on "
                       f"its own session over this path",
         }
-    out: dict = {"supported": True, "reported": reported}
+        if is_snowflake:
+            out["agent_activation"] = _agent_activation_hint(prof, None)
+        return out
+    out = {"supported": True, "reported": reported}
     if "agent_activated" in reported:
         activated = str(reported["agent_activated"]).upper() == "TRUE"
         out["agent_activated"] = activated
-        if not activated:
-            out["note"] = (
-                "This session is NOT agent-activated, so any policy keyed on "
-                "IS_AGENT_ACTIVATED will not fire. lakesh cannot set it — a "
-                "session earns it from how it authenticated. Reaching it "
-                "needs an OAuth security integration created with "
-                "IS_AGENTIC = TRUE, or a SERVICE_AGENT user."
-            )
+        if is_snowflake:
+            out["agent_activation"] = _agent_activation_hint(prof, activated)
     if "lakesh_client" in reported:
         # The label lakesh set, echoed back from the source rather than
         # from local state — the round trip is the only thing that proves

@@ -207,19 +207,47 @@ def test_a_custom_factory_may_return_a_full_session(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# the Snowflake application default (agent activation)
+# the Snowflake application string (agent activation is opt-in)
+#
+# The only strings Snowflake accepts as agent-active are its own Cortex
+# Code identifiers (cortex_code_cli / cortex_code_desktop, measured), so
+# activating is impersonation. lakesh is honest by default and only sends
+# the marker when the operator explicitly opts in AND an agent is driving.
 
-def test_mcp_caller_defaults_to_the_activating_application():
-    """Over MCP, lakesh sends the marker that flips IS_AGENT_ACTIVATED so
-    agent-masking policies apply. Verified end to end against the account."""
-    assert backend._default_application("mcp") == "cortex_code_cli"
+def _sf(**kw):
+    return Profile(name="s", type="python", backend="snowflake",
+                   dialect="snowflake", **kw)
 
 
-def test_cli_caller_stays_honestly_labelled():
-    """A human at the REPL must not be marked as an agent (it would be
-    masked as one)."""
-    app = backend._default_application("cli")
+def test_honest_by_default_over_mcp():
+    """No opt-in: even over MCP lakesh does NOT impersonate Cortex Code."""
+    app = backend._snowflake_application(_sf(), "mcp")
     assert app.startswith("lakesh/") and "cortex" not in app
+
+
+def test_opt_in_activates_over_mcp():
+    app = backend._snowflake_application(_sf(agent_activation=True), "mcp")
+    assert app == "cortex_code_cli"
+
+
+def test_env_var_opts_in_server_wide(monkeypatch):
+    monkeypatch.setenv("LAKESH_SNOWFLAKE_AGENT_ACTIVATION", "1")
+    assert backend._snowflake_application(_sf(), "mcp") == "cortex_code_cli"
+
+
+def test_a_human_at_the_cli_is_never_impersonated():
+    """Even opted in, the CLI caller stays honest — activation is about an
+    agent driving, and a human marked as an agent would be masked as one."""
+    app = backend._snowflake_application(_sf(agent_activation=True), "cli")
+    assert app.startswith("lakesh/") and "cortex" not in app
+
+
+def test_agent_activation_opt_in_reads_flag_and_env(monkeypatch):
+    monkeypatch.delenv("LAKESH_SNOWFLAKE_AGENT_ACTIVATION", raising=False)
+    assert backend.agent_activation_opted_in(_sf()) is False
+    assert backend.agent_activation_opted_in(_sf(agent_activation=True)) is True
+    monkeypatch.setenv("LAKESH_SNOWFLAKE_AGENT_ACTIVATION", "true")
+    assert backend.agent_activation_opted_in(_sf()) is True
 
 
 # --------------------------------------------------------------------------

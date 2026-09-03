@@ -35,6 +35,7 @@ metadata queries on the DuckDB path.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Protocol, runtime_checkable
 
 import duckdb
@@ -333,12 +334,12 @@ def _duckdb_backend(profile: Profile, *, caller: str | None = None):
 def _snowflake_backend(profile: Profile, *, caller: str | None = None):
     """snowflake-connector-python — pure Python, no ADBC `.so`.
 
-    Two things this backend owns, both established by measurement:
-    it bypasses the frozen ADBC driver, and its `application` reaches
-    Snowflake's `CLIENT_ENVIRONMENT.APPLICATION` verbatim. The default
-    activates agent-masking for the MCP caller (`cortex_code_cli`), stays
-    honest for the CLI, and an explicit `options.application` overrides
-    either — see the README on the audit-trail tradeoff.
+    It bypasses the frozen ADBC driver, and its `application` reaches
+    Snowflake's `CLIENT_ENVIRONMENT.APPLICATION` verbatim — which is the
+    only lever that can flip `IS_AGENT_ACTIVATED`. lakesh sends an
+    **honest** label by default and only impersonates Cortex Code when
+    the operator opts in; see `_snowflake_application`. An explicit
+    `options.application` overrides everything.
     """
     try:
         import snowflake.connector as sfc
@@ -348,7 +349,7 @@ def _snowflake_backend(profile: Profile, *, caller: str | None = None):
             "pip install 'lakesh[snowflake-python]'"
         ) from None
     opts = _coerce_options(profile.options)
-    opts.setdefault("application", _default_application(caller))
+    opts.setdefault("application", _snowflake_application(profile, caller))
     return sfc.connect(**opts)
 
 
@@ -520,16 +521,34 @@ _SHIPPED_BACKENDS = {
 }
 
 
-def _default_application(caller: str | None) -> str:
-    """The Snowflake `application` string lakesh sends by default.
+# The application string that flips IS_AGENT_ACTIVATED. It is Snowflake's
+# own Cortex Code CLI identifier — the allowlist is exact-match,
+# case-insensitive, and (measured) also accepts `cortex_code_desktop`; no
+# honest/third-party value activates. Sending it is impersonation, hence
+# opt-in.
+_AGENT_MARKER = "cortex_code_cli"
 
-    Agent (MCP) sessions default to the marker that activates
-    agent-masking policies; a human at the CLI stays honestly labelled and
-    is *not* marked as an agent (it would otherwise be masked as one). An
-    operator overrides either via `options.application`.
+
+def agent_activation_opted_in(profile: Profile) -> bool:
+    """Whether this profile is opted in to Snowflake agent activation —
+    the profile flag, or the server-wide env var as a default."""
+    if getattr(profile, "agent_activation", False):
+        return True
+    return os.environ.get("LAKESH_SNOWFLAKE_AGENT_ACTIVATION", "").lower() in (
+        "1", "true", "yes", "on")
+
+
+def _snowflake_application(profile: Profile, caller: str | None) -> str:
+    """The Snowflake `application` string lakesh sends.
+
+    Honest by default (`lakesh/<version> <caller>`), which does **not**
+    activate. Only when the operator opts in *and* an agent (MCP) is
+    driving does lakesh send the Cortex Code marker that activates — the
+    one deliberate, eyes-open impersonation. A human at the CLI is never
+    silently marked as an agent.
     """
-    if caller == "mcp":
-        return "cortex_code_cli"      # activates IS_AGENT_ACTIVATED
+    if caller == "mcp" and agent_activation_opted_in(profile):
+        return _AGENT_MARKER
     return f"lakesh/{_version()} {caller or 'cli'}"
 
 
